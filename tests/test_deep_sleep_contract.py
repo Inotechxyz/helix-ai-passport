@@ -153,6 +153,32 @@ class DeepSleepContractTest(unittest.TestCase):
         self.assertLess(body.index("bsp_lvgl_lock(1000)"),
                         body.index("bsp_display_prepare_deep_sleep()"))
 
+    def test_application_initializes_the_fuel_gauge_before_the_ui(self) -> None:
+        app = read("main/langstudy_app.c")
+        body = function_body(app, "ls_app_start")
+        # bsp_battery_soc() answers -1 until bsp_battery_init() has run, so the
+        # header gauge would show an empty outline on every boot without it.
+        self.assertIn("bsp_battery_init()", body)
+        self.assertLess(body.index("bsp_battery_init()"), body.index("ls_ui_init()"))
+
+    def test_application_sleep_order_matches_bsp_contract(self) -> None:
+        app = read("main/langstudy_app.c")
+        body = function_body(app, "enter_deep_sleep")
+        self.assertIn("BSP_BTN_MV_RELEASED_MIN", body)
+        calls = [
+            "bsp_button_prepare_deep_sleep(",
+            "esp_deep_sleep_enable_gpio_wakeup(",
+            "bsp_battery_sleep()",
+            "bsp_audio_sleep()",
+            "bsp_audio_prepare_deep_sleep()",
+            "bsp_i2c_prepare_deep_sleep()",
+            "bsp_lvgl_lock(1000)",
+            "bsp_display_prepare_deep_sleep()",
+            "esp_deep_sleep_start()",
+        ]
+        positions = [body.index(call) for call in calls]
+        self.assertEqual(positions, sorted(positions))
+
 
 if __name__ == "__main__":
     unittest.main()

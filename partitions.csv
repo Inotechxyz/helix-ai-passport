@@ -1,4 +1,8 @@
+# Language-study application layout.
+# NVS is enlarged to hold two validated 100-word content slots (A/B), progress,
+# device settings, and NVS garbage-collection headroom. The factory application
+# still occupies almost all of the remaining 8 MB.
 # Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x7f0000,
+nvs,      data, nvs,     0x9000,   0x20000,
+phy_init, data, phy,     0x29000,  0x1000,
+factory,  app,  factory, 0x30000,  0x7d0000,

@@ -24,21 +24,48 @@ CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_DEF_REFR_PERIOD=20
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
 # LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 本 demo UI 简单,24KB 足够;若自建复杂界面出现绘制卡死/看门狗,调大此值。
+# The language-study UI is deliberately simple; 24 KB is enough. Raise it only
+# after measuring on-device allocation failures.
 CONFIG_LV_MEM_SIZE_KILOBYTES=24
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
-# --- Bluetooth LE / NimBLE ---
-# ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=n
-CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# --- TLS for DeepSeek HTTPS ---
+# The device validates api.deepseek.com with the ESP-IDF CA bundle. Time must be
+# synchronized with SNTP before the first HTTPS request.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# Dynamic record buffers. A static build allocates the RX and TX record buffers
+# at handshake time and keeps them for the whole session, fragmenting the
+# post-handshake heap badly enough that the generated-pack buffer cannot be
+# allocated even though bytes remain free. With dynamic buffers mbedTLS
+# allocates a record buffer only while a record is transferred and frees it once
+# the HTTP client consumes the data. This is the largest RAM saving for the
+# refresh path on the SRAM-only ESP32-C3.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Asymmetric record buffers with a smaller TX side. The RX maximum stays at
+# 8 KB: the server's certificate flight can arrive in a single record larger
+# than 4 KB, which would fail the handshake. With dynamic buffering the RX
+# buffer is no longer held for the whole session, so its size only matters for
+# the brief moment a record is being read.
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# --- Wi-Fi buffers ---
+# The application holds one station connection and streams small HTTP/SSE
+# responses; it does not need the stock 10 static RX buffers (~16 KiB reserved
+# at init). Trimming them leaves more contiguous internal RAM for TLS and the
+# generated-pack buffer. Dynamic buffers are allocated on demand, so capping
+# them limits the peak without reserving RAM at idle.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=24
+
+# --- Bluetooth LE ---
+# The language-study application does not use BLE. Disabling it frees internal
+# RAM for Wi-Fi + TLS + LVGL on the no-PSRAM ESP32-C3. The baseline demo sources
+# remain in the repository but are not linked into this application.
+CONFIG_BT_ENABLED=n

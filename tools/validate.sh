@@ -42,6 +42,17 @@ run_static_checks() {
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_key_guard.c -o "${test_dir}/test_key_guard"
     "${test_dir}/test_key_guard"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_langstudy_logic.c \
+        main/langstudy_autoplay.c main/langstudy_builtin.c \
+        main/langstudy_content.c main/langstudy_edge_token.c \
+        main/langstudy_gen.c main/langstudy_json.c \
+        main/langstudy_phoneme.c main/langstudy_progress.c \
+        main/langstudy_resample.c \
+        main/langstudy_session.c main/langstudy_setup_form.c \
+        main/langstudy_synth.c main/langstudy_ws_frame.c -lm \
+        -o "${test_dir}/test_langstudy_logic"
+    "${test_dir}/test_langstudy_logic"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
         tests/test_bsp_display_rounding.c components/bsp/src/bsp_display_rounding.c \
         -o "${test_dir}/test_bsp_display_rounding"
@@ -80,6 +91,7 @@ run_static_checks() {
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_verify_firmware.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_langstudy_sync_server.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_archive_firmware.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_install_passport_skills.py
     rm -rf "${test_dir}"

@@ -38,6 +38,11 @@ esp_err_t bsp_audio_prepare_deep_sleep(void);
 // 唤醒会重启应用，应由 bsp_audio_init() 按正常启动流程重新初始化。
 esp_err_t bsp_audio_wake(void);
 
+// 彻底释放 codec、I2S 通道和 codec 接口，把内部 RAM 还给系统(例如联网/TLS 前)。
+// 调用方必须先停止所有 PCM 读写；共享 I2C 总线仍归 bsp_i2c 所有，不受影响。
+// 释放后若需再次播放，重新调用 bsp_audio_init()。函数幂等：未初始化时返回 ESP_OK。
+esp_err_t bsp_audio_deinit(void);
+
 // 播放 / 录音。bytes 为字节数(16bit 单声道时 = 采样数 x 2)。
 esp_err_t bsp_audio_write(const void *pcm, size_t bytes);
 esp_err_t bsp_audio_read(void *pcm, size_t bytes);

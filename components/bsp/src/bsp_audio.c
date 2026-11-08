@@ -300,10 +300,13 @@ static void audio_cleanup(void) {
 }
 
 static esp_err_t i2s_full_duplex_init(void) {
+    // 4 个描述符 x 240 帧 = 每声道 60 ms 缓冲。双声道全双工下每一帧是
+    // 240 * 2 槽 * 2 字节 = 960 字节, 6 个描述符要在 SRAM 紧张时多占 3.8 KB,
+    // 而在线语音必须同时容纳 TLS、MP3 解码器和这里的 DMA。
     i2s_chan_config_t chan = {
         .id = BSP_I2S_PORT,
         .role = I2S_ROLE_MASTER,
-        .dma_desc_num = 6,
+        .dma_desc_num = 4,
         .dma_frame_num = 240,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
@@ -551,6 +554,33 @@ esp_err_t bsp_audio_wake(void) {
 
     s_sleep_result = ESP_OK;
     ESP_LOGI(TAG, "ES8311 已从低功耗状态恢复");
+    return ESP_OK;
+}
+
+esp_err_t bsp_audio_deinit(void)
+{
+    if (!s_initialized && !s_tx && !s_rx && !s_ctrl && !s_data && !s_codec && !s_gpio) {
+        return ESP_OK;
+    }
+
+    // Callers have already stopped every PCM transfer. Suspend first so the
+    // codec is quiet before its interface objects are released.
+    esp_err_t suspend_error = ESP_OK;
+    if (s_initialized && !s_sleeping) suspend_error = bsp_audio_sleep();
+
+    audio_cleanup();
+
+    // audio_delete_codec() sets this when the codec interface could not be
+    // released. Rebuilding would silently skip hardware initialization, so the
+    // caller is told to reboot rather than continue with a false success.
+    if (s_codec_release_failed) {
+        ESP_LOGE(TAG, "音频资源释放失败，需重启恢复");
+        return ESP_FAIL;
+    }
+    if (suspend_error != ESP_OK) {
+        ESP_LOGW(TAG, "释放音频前的休眠未完全成功: %s", esp_err_to_name(suspend_error));
+    }
+    ESP_LOGI(TAG, "ES8311 与 I2S 资源已释放");
     return ESP_OK;
 }
 

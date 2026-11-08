@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static contracts for the deep-sleep key-wake guard wiring in main.c."""
+"""Static contracts for the deep-sleep key-wake guard wiring in langstudy_app.c."""
 
 from pathlib import Path
 import re
@@ -32,15 +32,21 @@ def function_body(source: str, name: str) -> str:
 class KeyWakeGuardWiringTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.main = read("main/main.c")
+        cls.app = read("main/langstudy_app.c")
 
     def test_on_key_consumes_the_guard_before_the_readiness_check(self) -> None:
         # A release can arrive after the post-init voltage sample but before input
         # dispatch is ready. on_key must run the guard first so that release still
         # disarms it, instead of being discarded by the readiness early-return.
-        body = function_body(self.main, "on_key")
+        body = function_body(self.app, "on_key")
         self.assertIn("key_guard_consume(", body)
-        self.assertLess(body.index("key_guard_consume("), body.index("!s_input_ready"))
+        self.assertLess(body.index("key_guard_consume("), body.index("!s_ready"))
+
+    def test_gpio_wake_arms_the_guard(self) -> None:
+        body = function_body(self.app, "ls_app_start")
+        self.assertIn("ESP_SLEEP_WAKEUP_GPIO", body)
+        self.assertIn("key_guard_arm(", body)
+        self.assertIn("key_guard_sync_released(", body)
 
 
 if __name__ == "__main__":
