@@ -4,7 +4,7 @@
 
 # LangStudy 英语学习应用
 
-`PASSPORT ENGLISH` 是运行在 AI Passport 硬件上的离线优先英语学习应用。学习进度保存在设备端，掉电不丢失。配置 Wi-Fi 后，用户可以选择联网刷新单词包，并与一个轻量的同步服务器合并进度。
+`PASSPORT ENGLISH` 是运行在 AI Passport 硬件上的离线优先英语学习应用。学习进度保存在设备端，掉电不丢失。配置 Wi-Fi 后，用户可以选择联网刷新单词包，并把进度同步到 Azure Blob Storage。
 
 本应用替换了 demo 菜单和 demo 页面。`main/main.c` 只调用 `ls_app_start()`；所有输入和状态处理位于 `langstudy_app.c`，笔记本风格的界面位于 `langstudy_ui.c`。硬件访问仍保留在 `components/bsp`。
 
@@ -24,7 +24,7 @@
 | BSP | `components/bsp` | 屏幕、按键、电池、音频、I2C、存储封装、睡眠准备。 |
 | 纯逻辑 | `main/langstudy_*.c` | 词包/进度解析、排程、音素、合成、JSON、生成结果提取、表单校验；无需 ESP-IDF 即可在主机测试。 |
 | 应用 | `main/langstudy_app.c`、`main/langstudy_ui.c` | 启动顺序、输入任务、界面、深度睡眠、联网结果编排。 |
-| 服务 | `main/langstudy_provision.c`、`langstudy_deepseek.c`、`langstudy_sync.c`、`langstudy_online.c` | SoftAP 配网页、DeepSeek HTTP、进度同步、后台任务队列。 |
+| 服务 | `main/langstudy_provision.c`、`langstudy_deepseek.c`、`langstudy_sync.c`、`langstudy_online.c` | SoftAP 配网页、DeepSeek HTTP、Azure 进度同步、后台任务队列。 |
 
 词包和进度的修改都发生在应用输入任务中。后台服务通过 `ls_online_poll()` 投递堆上分配的结果，界面在合并后负责释放。
 
@@ -40,11 +40,32 @@
 
 自动循环只播放与进入时屏幕上单词 `lesson_id` 相同的单词，因此即使词包包含多课，循环也不会离开当前课程。顶栏进度行显示 `AUTO n / m`，帮助文字上方的细条按设定的停留时间逐渐缩短；进度条走完后切换到下一个单词。停留时间默认 5 秒，可在 `SETTINGS` 的 `WORD DELAY` 中修改。任意按键（包括 DOWN 短按）都会退出自动播放且不计分；长按 OK 会先退出再打开菜单。该模式不会跨重启保留。
 
-菜单项：`REFRESH WORDS`、`PROGRESS`、`CONNECTION CHECK`、`SETTINGS`、`PHONE SETUP`、`NEW SESSION`、`RESET PROGRESS`、`BACK`。选择 `REFRESH WORDS` 会打开词库等级列表（`CET4`、`CET6`、`IELTS`）。需要网络的菜单项会显示 `(SETUP)` 并说明缺少什么，而不是静默失败。
+菜单项：`REFRESH WORDS`、`PROGRESS`、`BUDDY`、`CREATE PROFILE`、`CONNECTION CHECK`、`SETTINGS`、`PHONE SETUP`、`NEW SESSION`、`RESET PROGRESS`、`BACK`。选择 `REFRESH WORDS` 会打开词库等级列表（`CET4`、`CET6`、`IELTS`）。需要网络的菜单项会显示 `(SETUP)` 并说明缺少什么，而不是静默失败。
 
-`PROGRESS` 始终可用，离线时也能打开。它显示已完成会话数、已作答卡片数、正确率、当前词包中已学单词数以及完成百分比。只有配置了同步 URL 时才提供 `SYNC NOW`；否则该行显示 `SYNC NOW (SETUP)` 并说明缺少 URL，而不是发起注定失败的请求。失败状态页在后台任务记录了诊断信息时显示 `DOWN: DETAIL`，按 DOWN 会打开错误详情页，其中包含 HTTP 状态码、可用字节数、重复单词或 HTTPS 错误。
+`PROGRESS` 始终可用，离线时也能打开。它显示已完成会话数、已作答卡片数、正确率、当前词包中已学单词数以及完成百分比。只有同时具备 Wi-Fi、Azure 容器 SAS URL 和档案时才提供 `SYNC NOW`；否则该行显示 `SYNC NOW (SETUP)` 并说明缺少什么，而不是发起注定失败的请求。失败状态页在后台任务记录了诊断信息时显示 `DOWN: DETAIL`，按 DOWN 会打开错误详情页，其中包含 HTTP 状态码、可用字节数、重复单词或 HTTPS 错误。
 
-学习界面顶栏只有一行：`PASSPORT ENGLISH`、竖直电池条（从底部按电量填充；绿色，低于 30% 转琥珀色，低于 15% 转红色，电量计没有读数时只显示空框）、Wi-Fi 图标和 `D` 徽标。Wi-Fi 与 `D` 图标在连接检查或词包刷新验证过对应链路后出现；两者在结果未知时保持隐藏，后续的离线操作不会清除此前检查得到的绿色图标。它们反映的是最后已知状态，而不是实时连接：每次联网操作结束后无线电都会被关闭。
+学习界面顶栏只有一行：`PASSPORT ENGLISH`、竖直电池条（从底部按电量填充；绿色，低于 30% 转琥珀色，低于 15% 转红色，电量计从未上报读数时只显示空框）、Wi-Fi 图标和 `D` 徽标。Wi-Fi 与 `D` 图标在连接检查或词包刷新验证过对应链路后出现；两者在结果未知时保持隐藏，后续的离线操作不会清除此前检查得到的绿色图标。它们反映的是最后已知状态，而不是实时连接：每次联网操作结束后无线电都会被关闭。
+
+深度休眠会重启整颗芯片，因此这三个值保存在 RTC 内存中，唤醒后立即重绘：链路图标来自最近一次成功的联网操作，电池条来自休眠前最后一次读数。首帧显示缓存值，随后由唤醒后的首个有效读数替换（电量计完成首次转换前，界面每 2 秒重试一次）。断电或重新烧录会清空 RTC 内存，此时顶栏从"未知"状态开始。只有电芯电压合理（至少 2500 mV）时读数才被采用，因此休眠中或刚重启、返回 `0x00` 的电量计不会被画成 `0%`。
+
+## 用户档案与数字伙伴
+
+`CREATE PROFILE` 会生成随机档案标识，并配对一个数字伙伴。界面可用 UP/DOWN 在 8 个预设名字之间切换；OK 生成 UUIDv4 风格的 36 字符标识和一个随机物种的伙伴，保存后直接打开 BUDDY 界面。已存在档案时，该界面只显示标识：它同时是云同步目录名，静默替换会让远端副本失去归属；`RESET PROGRESS` 会一并删除档案和伙伴。
+
+伙伴有四个物种（`BLOB`、`KIT`、`PIPLING`、`DRAKE`）和四个形态。初始为形态 1，XP 达到 300、900、2000 时各进化一次，共三次。每次进化解锁一个技能：
+
+| 形态 | 技能 | 效果 |
+| --- | --- | --- |
+| 1 | 无 | — |
+| 2 | `FOCUS` | 每次答对 +10% XP |
+| 3 | `ECHO` | 答错后朗读该单词 |
+| 4 | `INSIGHT` | 再 +20% XP（与 `FOCUS` 叠加） |
+
+答对获得 `10 × 英语等级` XP，因此 `SETTINGS` 中更高的等级（1–10）更值钱。伙伴状态良好（能量至少 60）时再额外获得 25%。答对恢复 2 点能量，答错消耗 2 点，每完成一个会话消耗 5 点。正确率达到 70% 的会话奖励 1 个零食（最多 999 个）。在 BUDDY 界面按 OK 喂食：消耗 1 个零食并恢复 25 点能量；长按 OK 返回菜单。
+
+`BUDDY` 界面把 24x24 调色板像素图以 2 倍绘制到画布，然后显示名字与物种、当前形态、距下一次进化的 XP、能量、零食和当前技能。当前会话的答案、进化和零食会在会话完成页汇总。伙伴状态每次作答后都会保存，掉电最多丢失当前这一张卡片。
+
+档案标识对应 Azure Blob 中的 `<profile id>` 虚拟目录。`SYNC NOW` 会把 `profiles/<profile id>/progress.lsprog` 写入手机配网页配置的容器；详见[进度同步](#进度同步)。
 
 ## 数据格式
 
@@ -78,10 +99,13 @@ END|<CRC32>
 ## 持久化
 
 - NVS 命名空间：`langstudy`。
-- 键：`wifi_ssid`、`wifi_pass`、`api_key`、`sync_url`、`exam`、`level`、`bright`、`volume`、`word_delay`、`avoid_hist`。
+- 键：`wifi_ssid`、`wifi_pass`、`api_key`、`sync_url`（Azure 容器 SAS URL）、`exam`、`level`、`bright`、`volume`、`word_delay`、`avoid_hist`、`prof_id`、`buddy`。
 - 词包使用两个槽位。新词包写入非活动槽，提交后再翻转索引，因此掉电时上一个词包仍然有效。损坏的槽位会在启动时跳过。
 - 如果两个槽位都失败，设备回退到内置的 100 词词包（`langstudy_builtin.c`）。
 - 每次作答后以及每完成一个学习会话后都会写入进度。
+- 伙伴记录同样采用"行文本 + CRC"约定：
+  `BUDDY|1|<物种>|<名字>|<形态>|<能量>|<零食>|<xp>|<revision>`，随后是
+  `END|<CRC32>`。每次作答和喂食后都会写入。记录损坏时会被忽略；若档案标识仍在，则生成一个新伙伴，避免菜单卡在无法使用的状态。
 
 ## 排程
 
@@ -119,7 +143,7 @@ due_session = session_count + 2 + interval[box]
 
 1. 设备显示 SSID `LangStudy-XXXX`、密码 `learnXXXX` 以及页面地址 `http://192.168.4.1`。
 2. 手机连接该 AP 并打开页面。
-3. 页面收集 Wi-Fi SSID/密码、DeepSeek API key 以及可选的同步 URL。
+3. 页面收集 Wi-Fi SSID/密码、DeepSeek API key 以及可选的 Azure Blob 容器 SAS URL。SAS 字段最多 512 个字符，和 API key 一样只写不回显：留空表示保留已保存的 URL，勾选复选框可删除。该 URL 是凭据，固件不会写入日志，也不会回显。
 4. 设备在写入 NVS 之前会先验证站点连接。验证失败会报告原因并且不保存任何内容。
 5. 如果已配置 Wi-Fi，设备会立刻运行连接检查，让手机配网结束时就能看到 Wi-Fi/DeepSeek 状态。
 6. AP 密码显示在屏幕上，但绝不会写入日志。
@@ -152,21 +176,47 @@ API key 在手机配网页输入并保存在 NVS。供开发者参考，`.env.ex
 
 刷新失败时 `ESP_ERR_HTTP_CONNECT` 会映射为 `Cannot reach DeepSeek (Wi-Fi/TLS)`，串口日志会带上 `errno` 和堆水位。
 
-## 可选的进度同步
+## 进度同步
 
-除非设置了 `sync_url`，否则不会同步。同步从 `PROGRESS` 界面启动：配置了 URL 时 `SYNC NOW` 会执行同步，否则该行显示 `SYNC NOW (SETUP)`。设备以 `text/plain` POST 自己的 `LSPROG` 快照，并接收合并后的快照。本地快照始终是权威来源：
+只有同时具备 Wi-Fi、手机配网页保存的容器 SAS URL 和 `CREATE PROFILE` 创建的档案时才会同步。同步从 `PROGRESS` 界面启动；缺任一项时该行显示 `SYNC NOW (SETUP)`，状态页会指出缺少什么。
 
-- 单词记录的 `revision` 更高时获胜；相同时保留本地副本；
-- 新的单词 ID 在表未满时追加；
-- `session_count` 和计数采用已完成会话更多的一方。
+### Azure 目录结构
 
-`tools/langstudy_sync_server.py` 仅使用标准库实现该协议：
+配置值是容器 SAS URL，例如
+`https://ACCOUNT.blob.core.windows.net/CONTAINER?sv=...&sig=...`。Blob 存储没有真正的目录：设备写入一个路径形式的 blob 名，因此门户中会看到 `profiles/<profile id>/` 目录：
 
-```sh
-python3 tools/langstudy_sync_server.py --port 8080 --store tools/var/sync-store
+```text
+CONTAINER/
+  profiles/
+    12345678-abcd-4f01-9ead-beef0badf00d/
+      progress.lsprog
 ```
 
-每个 URL 路径保存独立快照，因此 `http://<host>:8080/devices/alice` 与 `.../devices/bob` 不会共享历史。服务器把文件保存在 `tools/var/` 下，该目录已被 git 忽略。`GET /health` 返回 `ok`；`GET <path>` 返回已存快照或 404。
+`progress.lsprog` 就是本地使用的 `LSPROG` 文本（`text/plain`）。容器必须已存在；SAS 需要读、创建和写权限（`sp` 包含 `r`、`c`、`w`），并应限制为 HTTPS（`spr=https`）。可在门户的 **容器 → 共享访问令牌** 中生成，或使用：
+
+```sh
+az storage container create --account-name ACCOUNT --name CONTAINER
+SAS=$(az storage container generate-sas --account-name ACCOUNT \
+  --name CONTAINER --permissions rcw --https-only \
+  --expiry 2027-01-01 -o tsv)
+echo "https://ACCOUNT.blob.core.windows.net/CONTAINER?$SAS"
+```
+
+把输出的完整 URL 粘贴到手机配网页。重新生成令牌后，用新的完整 URL 替换已保存的值。
+
+该 URL 是持有者凭据，和 API key 一样保存在 NVS 中；固件从不打印它，也不会把它放进状态页或日志。失败时只报告 `HTTP 403`（SAS 过期或错误）、`HTTP 404`（容器不存在）或传输错误。
+
+### 合并顺序
+
+同步采用读—合并—写，而不是服务端合并：
+
+1. 用 `x-ms-version` 和 `x-ms-date` 请求 `GET profiles/<id>/progress.lsprog`；由于 Azure 会拒绝过期日期且 TLS 需要时钟，会先运行 SNTP。
+2. `404` 表示该档案首次同步，合并结果就是本地快照；其他非 200 状态会带着状态码中止。
+3. 把远端文档合并到本地快照的副本中。本地始终是权威来源：单词记录的 `revision` 更高时获胜，相同时保留本地副本；新的单词 ID 在表未满时追加；`session_count` 和计数采用已完成会话更多的一方。
+4. 用 `PUT` 写回合并结果，类型为 `BlockBlob`（`x-ms-blob-type: BlockBlob`）。新建 blob 返回 `201`，覆盖返回 `200`。
+5. 界面把返回的快照再次合并到实时状态（幂等）并保存。
+
+GET 响应和 PUT 请求体复用同一个 20 KiB 缓冲区，避免在 TLS 占用内存时再分配一块大缓冲。当前假设一个档案只由一台设备同步，没有 ETag/`If-Match` 重试；若两台设备同时同步，后写入者获胜，但下一次同步会按 revision 合并另一台设备的记录。
 
 ## 电源管理
 
@@ -183,7 +233,7 @@ python3 tools/langstudy_sync_server.py --port 8080 --store tools/var/sync-store
 ./tools/validate.sh --firmware  # ESP-IDF 5.5.3 构建、合并镜像、校验器
 ```
 
-静态检查包含 `tests/test_langstudy_logic.c`（词包/进度、排程、音素、合成、JSON、生成结果提取、表单）以及 `tests/test_langstudy_sync_server.py`。
+静态检查包含 `tests/test_langstudy_logic.c`（词包/进度、排程、音素、合成、JSON、生成结果提取、表单）、`tests/test_langstudy_buddy.c` 以及 `tests/test_langstudy_azure.c`（SAS URL 校验、blob 路径拼接和 `x-ms-date` 格式）。
 
 `tools/langstudy_demo_pack.txt` 是内置词包的最终化副本，可用于检查线格式，或在没有设备时向工具提供已知良好的词包。
 
@@ -194,22 +244,24 @@ python3 tools/langstudy_sync_server.py --port 8080 --store tools/var/sync-store
 3. 长按 OK：菜单打开；UP/DOWN 移动高亮，OK 选择。
 4. 按 UP：当前单词可听见；睡眠时音频干净停止。
 5. 选择 `PHONE SETUP`：AP 出现、页面可打开，只有设备成功加入后才保存网络；随后自动运行连接检查。测试失败时页面会指出原因（`Wi-Fi not found`、`Wrong Wi-Fi password` 或驱动错误码），并且不保存任何内容。
-6. 选择 `CONNECTION CHECK`：屏幕分别显示 Wi-Fi、时钟和 DeepSeek 状态；使用有效 API key 时显示 `DeepSeek: OK`。检查成功后，学习界面顶栏右侧出现 Wi-Fi 和 `D` 图标；同一行还显示 `PASSPORT ENGLISH` 和竖直电池条（电量计没有读数时为空框）。
+6. 选择 `CONNECTION CHECK`：屏幕分别显示 Wi-Fi、时钟和 DeepSeek 状态；使用有效 API key 时显示 `DeepSeek: OK`。检查成功后，学习界面顶栏右侧出现 Wi-Fi 和 `D` 图标；同一行还显示 `PASSPORT ENGLISH` 和竖直电池条（电量计从未上报读数时为空框）。图标和上次的电池填充会跨深度休眠保留，唤醒后在执行任何联网操作之前就重绘。
 7. 学习卡片的顺序为单词、音标、中文翻译；翻译最多换行两行且不与词性重叠。
 8. 发音行渲染为 IPA（例如 `/həˈloʊ/`），而不是原始 ARPAbet；较长的音标水平滚动。`climate` 显示为 `/ˈklaimət/`，`recycle` 显示为 `/riːˈsaikəl/`，双元音中的 `i` 清晰可见，而不是空白竖条。`desert` 显示为 `/ˈdɛzərt/`，`glacier` 显示为 `/ˈgleiʃər/`，结尾的 `ər` 清晰可见。
 9. Wi-Fi 已连接时点按单词：神经语音朗读单词文本，串口日志出现 `ls_edge_tts` 的堆内存与播放记录。断开 Wi-Fi（或走出覆盖范围）后再次点按：同一个单词改由离线合成器朗读。快速连续点按多个单词时，上一个单词会立即停止，而不是排队依次播放。
 10. 选择 `REFRESH WORDS`：出现 `CET4`、`CET6`、`IELTS` 的二级列表。如果尚未保存 Wi-Fi 网络或 DeepSeek key，设备会立即显示 `WI-FI OR DEEPSEEK NOT SET UP`，不会发起网络请求。选择某个等级后会请求 6 课、60 词的随机新词包，且不与当前词包及近期生成历史共享任何单词（已学过的单词优先排除），每次使用新的随机种子，有效等级随学习进度提升。至少 30 个完整单词的短响应会被裁剪后接受；格式错误的响应会使用更严格的提示词重试一次。若接受的回复复用了排除列表中的单词，词包仍然生效：状态页显示 `SOME WORDS REPEATED`，`DOWN: DETAIL` 会列出具体单词。成功提示显示实际接受的单词数（通常为 `60 new words ready`）。失败状态页会提供 `DOWN: DETAIL`，显示后台任务记录的诊断信息。当 `PROGRESS` 中的完成度达到 `100%` 且一次会话结束时，只要已配置 Wi-Fi 和 DeepSeek key，设备会自动刷新，状态页显示 `ALL WORDS STUDIED / REFRESHING <等级>`；由于多完成了一个会话，新词包的有效等级也会更高。
 11. 选择 `SETTINGS`：UP/DOWN 在 `ENGLISH LEVEL`、亮度、音量和 `WORD DELAY` 之间移动，OK 进入调整模式，UP/DOWN 改变数值，长按 OK 退出或保存。四个数值都能在断电重启后保留。`ENGLISH LEVEL` 为 1（入门）到 10（专业），默认 4，是取词的起始等级；进度会让有效等级高于它。`WORD DELAY` 是自动播放的停留秒数（默认 5）。
 12. 在学习卡片上长按 DOWN 开始当前课程的自动循环：进度行显示 `AUTO n / m`，细条按停留时间走完后自动切换到下一张卡片。再次长按 DOWN（或按任意其他键）退出；长按 OK 退出并打开菜单。循环不得离开当前课程，也不得改变会话得分。
-13. 选择 `PROGRESS`：界面显示会话数、已作答卡片数、正确率、已学单词数和完成百分比。配置了同步 URL 时，`SYNC NOW` 会让服务器记录 POST，设备报告合并结果；未配置时该行显示 `SYNC NOW (SETUP)`。
+13. 选择 `PROGRESS`：界面显示会话数、已作答卡片数、正确率、已学单词数和完成百分比。具备 Wi-Fi、SAS URL 和档案时，`SYNC NOW` 会在容器中创建 `profiles/<profile id>/progress.lsprog` 并显示 `Progress synced`；再次同步会覆盖同一个 blob。缺项时该行显示 `SYNC NOW (SETUP)`。
 14. 连续完成两个会话，确认词包单词足够时第二个会话不会重复第一个会话的卡片。
 15. 保持空闲：30 秒后屏幕变暗，5 分钟后睡眠；按键可唤醒。
-16. 选择 `RESET PROGRESS`：所有学习记录和近期生成的排除历史被清除并开始新会话，当前词包保留。
+16. 选择 `RESET PROGRESS`：所有学习记录、近期生成的排除历史、档案及其伙伴都会被清除并开始新会话，当前词包保留。
+17. 选择 `CREATE PROFILE`：UP/DOWN 切换预设名字，OK 后进入 BUDDY 界面，显示精灵图、形态、XP、能量和零食。作答后确认伙伴获得 XP（英语等级越高越多，能量至少 60 时再增加 25%）。有零食时按 OK 喂食；长按 OK 返回菜单。断电重启后确认档案标识、名字、物种和 XP 均恢复。正确率至少 70% 的会话会奖励 1 个零食。
 
 ## 已知限制
 
 - DeepSeek 输出具有随机性；词包校验器只能保证格式与内容合法，不能保证教学质量。
-- 进度同步没有认证或设备身份。若暴露在公网，应放在可信网络或反向代理之后。
+- 进度同步依赖容器 SAS。该 token 是唯一凭据：应只授权一个容器、仅允许 HTTPS、设置有限有效期，并在过期前重新生成（在手机配网页重新保存）。固件只在 NVS 中保存 URL，因此恢复出厂设置或 `RESET PROGRESS` 都不会吊销 SAS。
+- 伙伴状态只保存在本机，同步上传的只有 `progress.lsprog`。使用同一档案标识的另一台设备会共享学习历史，但伙伴从新状态开始。
 - 共振峰合成器比早期版本更清晰，但仍属合成音，现在只是离线回退方案。
 - 在线发音依赖微软未公开文档的接口；`Sec-MS-GEC` 令牌、客户端版本和 User-Agent 彼此绑定，服务端一旦调整，设备会静默回退到离线语音，直到更新 `langstudy_tts_edge.c` 中的常量。
 - 在线发音在最后一次点按后仍保持 Wi-Fi 开启 60 秒，避免每次点按都重新连接；因此使用神经语音学习时功耗明显高于纯离线路径。

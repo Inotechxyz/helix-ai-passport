@@ -161,6 +161,41 @@ class DeepSleepContractTest(unittest.TestCase):
         self.assertIn("bsp_battery_init()", body)
         self.assertLess(body.index("bsp_battery_init()"), body.index("ls_ui_init()"))
 
+    def test_application_restores_the_header_status_before_the_ui(self) -> None:
+        app = read("main/langstudy_app.c")
+        body = function_body(app, "load_state")
+        # Deep sleep resets wifi_ok/deepseek_ok and the cached SOC is the only
+        # way the header can be drawn again before an online operation runs.
+        self.assertIn("ls_status_cache_get(", body)
+        self.assertIn("state->wifi_ok = cached.wifi_ok", body)
+        self.assertIn("state->deepseek_ok = cached.deepseek_ok", body)
+
+    def test_application_saves_the_battery_before_sleeping_the_gauge(self) -> None:
+        app = read("main/langstudy_app.c")
+        body = function_body(app, "enter_deep_sleep")
+        self.assertIn("ls_status_cache_set_soc(", body)
+        self.assertLess(body.index("ls_status_cache_set_soc("),
+                        body.index("bsp_battery_sleep()"))
+
+    def test_ui_caches_the_values_the_next_wake_needs(self) -> None:
+        ui = read("main/langstudy_ui.c")
+        self.assertIn("ls_status_cache_set_links(", function_body(ui, "handle_online"))
+        self.assertIn("ls_status_cache_set_soc(", function_body(ui, "ls_ui_tick"))
+        init = function_body(ui, "ls_ui_init")
+        self.assertIn("ls_status_cache_get(", init)
+        self.assertLess(init.index("ls_status_cache_get("),
+                        init.index("update_battery_bar("))
+
+    def test_battery_ready_check_does_not_trust_a_zero_reading(self) -> None:
+        battery = read("components/bsp/src/bsp_battery.c")
+        # A restarted CW2017 answers 0 to SOC and VCELL until its first
+        # conversion; the old check accepted soc <= 100, i.e. 0, as ready.
+        body = function_body(battery, "cw_wait_soc_ready")
+        self.assertIn("bsp_battery_mv()", body)
+        self.assertIn("reading_is_plausible(", body)
+        soc = function_body(battery, "bsp_battery_soc")
+        self.assertRegex(soc, r"mv\s*<\s*CW_VCELL_MIN_MV")
+
     def test_application_sleep_order_matches_bsp_contract(self) -> None:
         app = read("main/langstudy_app.c")
         body = function_body(app, "enter_deep_sleep")

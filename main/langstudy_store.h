@@ -6,6 +6,7 @@
 // previous pack authoritative; a corrupt slot is skipped on load.
 #pragma once
 
+#include "langstudy_buddy.h"
 #include "langstudy_model.h"
 
 #include "esp_err.h"
@@ -44,6 +45,17 @@ esp_err_t ls_store_clear_pack(void);
 bool ls_store_load_progress(ls_progress_t *out);
 esp_err_t ls_store_save_progress(const ls_progress_t *progress);
 esp_err_t ls_store_clear_progress(void);
+
+// Profile identity used as the Azure blob prefix. `out` receives the 36-char
+// UUID plus its terminator; false when no valid id has been stored.
+bool ls_store_load_profile_id(char *out, size_t cap);
+esp_err_t ls_store_save_profile_id(const char *id);
+esp_err_t ls_store_clear_profile_id(void);
+
+// Buddy state. Load returns false on a missing or corrupt record and leaves
+// *out untouched; the caller decides whether to create a new buddy.
+bool ls_store_load_buddy(ls_buddy_t *out);
+esp_err_t ls_store_save_buddy(const ls_buddy_t *buddy);
 
 // Rolling "recently generated words" list used to keep refreshes from cycling
 // vocabulary. `out` receives a NUL-terminated space-separated list; a missing

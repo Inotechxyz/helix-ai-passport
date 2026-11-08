@@ -22,7 +22,9 @@
 #define PROV_TASK_STACK 6144
 #define PROV_TASK_PRIO 4
 #define PROV_QUEUE_DEPTH 2
-#define PROV_FORM_MAX 2048
+// The SAS URL is percent-encoded once by the browser, so a 512-character
+// token can expand before form decoding. Leave room for the other fields.
+#define PROV_FORM_MAX 4096
 // The first association after a boot also pays for the targeted scan and, on
 // some routers, DHCP; 15 s was short enough that a slow-but-working AP looked
 // like a failure while the SoftAP was still serving the phone.
@@ -41,6 +43,7 @@ typedef struct {
     char api[LS_API_KEY_MAX + 1];
     char sync[LS_SYNC_URL_MAX + 1];
     bool clear_api;
+    bool clear_sync;
 } prov_request_t;
 
 static const char *TAG = "ls_prov";
@@ -177,6 +180,8 @@ static esp_err_t post_save_handler(httpd_req_t *req)
     (void)form_field(body, len, "sync", request.sync, sizeof(request.sync));
     char flag[2];
     request.clear_api = form_field(body, len, "clear_api", flag, sizeof(flag));
+    request.clear_sync = form_field(body, len, "clear_sync", flag,
+                                    sizeof(flag));
     free(body);
 
     if (!ls_setup_validate_ssid(request.ssid) ||
@@ -274,8 +279,14 @@ static void provision_worker(void *arg)
             snprintf(updated.api_key, sizeof(updated.api_key), "%s",
                      request.api);
         }
-        snprintf(updated.sync_url, sizeof(updated.sync_url), "%s",
-                 request.sync);
+        // The SAS is written only when the box has a new value; blank means
+        // "keep", and the checkbox is the way to disable sync.
+        if (request.clear_sync) {
+            updated.sync_url[0] = '\0';
+        } else if (request.sync[0] != '\0') {
+            snprintf(updated.sync_url, sizeof(updated.sync_url), "%s",
+                     request.sync);
+        }
 
         esp_err_t err = ls_config_save_all(&updated);
         if (err != ESP_OK) {

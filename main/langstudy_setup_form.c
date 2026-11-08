@@ -1,6 +1,8 @@
 // main/langstudy_setup_form.c
 #include "langstudy_setup_form.h"
 
+#include "langstudy_azure.h"
+
 #include <string.h>
 
 static int hex_value(char c)
@@ -118,15 +120,8 @@ bool ls_setup_validate_api_key(const char *key)
 bool ls_setup_validate_server_url(const char *url)
 {
     if (!url) return false;
-    size_t len = strlen(url);
-    if (len == 0) return true; // sync disabled
-    if (len > 160) return false;
-    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
-        return false;
-    }
-    for (size_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)url[i];
-        if (c <= 0x20 || c > 0x7E || c == '|') return false;
-    }
-    return true;
+    if (url[0] == '\0') return true; // sync disabled
+    // The value is a container SAS URL: it must be HTTPS because the query
+    // string is a bearer credential, and it must carry a signature.
+    return ls_azure_url_valid(url);
 }

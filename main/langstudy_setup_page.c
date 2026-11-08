@@ -112,11 +112,25 @@ size_t ls_setup_page_render(char *out, size_t cap,
                   "Delete the saved API key</label></p>");
     }
 
-    w_str(&w, "<label>Sync server URL (optional)</label>");
-    w_str(&w, "<input type=\"text\" name=\"sync\" maxlength=\"160\" "
-              "placeholder=\"http://192.168.1.10:8080/progress\" value=\"");
-    w_escaped(&w, config->sync_url);
+    w_str(&w, "<label>Azure Blob SAS URL (optional)</label>");
+    w_str(&w, "<input type=\"password\" name=\"sync\" maxlength=\"512\" "
+              "autocomplete=\"off\" spellcheck=\"false\" placeholder=\"");
+    if (ls_config_has_sync_url(config)) {
+        w_str(&w, "saved (leave blank to keep)");
+    } else {
+        w_str(&w, "https://ACCOUNT.blob.core.windows.net/CONTAINER?sv=...");
+    }
     w_str(&w, "\">");
+    w_str(&w, "<p class=\"hint\">Container SAS URL from the Azure portal. It "
+              "must be HTTPS and allow read, create and write. Progress is "
+              "stored under <b>profiles/&lt;profile id&gt;/progress.lsprog</b>."
+              "</p>");
+    if (ls_config_has_sync_url(config)) {
+        w_str(&w, "<p class=\"hint\"><label style=\"display:inline;"
+                  "text-transform:none;letter-spacing:0\">"
+                  "<input type=\"checkbox\" name=\"clear_sync\" value=\"1\"> "
+                  "Delete the saved SAS URL</label></p>");
+    }
 
     w_str(&w, "<button type=\"submit\">Save and connect</button></form>");
 

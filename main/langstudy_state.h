@@ -4,6 +4,7 @@
 // langstudy_online, so no lock is needed around this struct.
 #pragma once
 
+#include "langstudy_buddy.h"
 #include "langstudy_config.h"
 #include "langstudy_model.h"
 #include "langstudy_store.h"
@@ -42,6 +43,15 @@ typedef struct {
     // reboot starts a new rotation.
     uint32_t prev_session_ids[LS_SESSION_CARDS];
     size_t prev_session_len;
+
+    // Profile identity created from the CREATE PROFILE menu. Empty until the
+    // learner creates one; it names the folder that sync writes into.
+    char profile_id[LS_PROFILE_ID_MAX + 1];
+
+    // Digital buddy paired with the profile. `buddy_valid` is false until a
+    // profile and buddy have been stored.
+    ls_buddy_t buddy;
+    bool buddy_valid;
 } ls_state_t;
 
 ls_state_t *ls_state(void);

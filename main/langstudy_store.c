@@ -18,6 +18,8 @@
 #define KEY_PACK_GEN "pack_gen"
 #define KEY_PROGRESS "progress"
 #define KEY_AVOID_HISTORY "avoid_hist"
+#define KEY_PROFILE_ID "prof_id"
+#define KEY_BUDDY "buddy"
 
 static const char *TAG = "ls_store";
 
@@ -320,5 +322,112 @@ esp_err_t ls_store_clear_avoid_history(void)
     err = bsp_storage_erase(handle, KEY_AVOID_HISTORY);
     if (err == ESP_OK) err = bsp_storage_commit(handle);
     bsp_storage_close(handle);
+    return err;
+}
+
+bool ls_store_load_profile_id(char *out, size_t cap)
+{
+    if (!out || cap < LS_PROFILE_ID_MAX + 1) return false;
+    out[0] = '\0';
+    if (!s_ready) return false;
+
+    nvs_handle_t handle;
+    if (bsp_storage_open(LS_NVS_NAMESPACE, &handle) != ESP_OK) return false;
+
+    // Stored without its terminator so the blob is exactly the id length; the
+    // caller's buffer has room for the NUL.
+    size_t len = 0;
+    esp_err_t err = bsp_storage_get_blob(handle, KEY_PROFILE_ID, NULL, &len);
+    if (err == ESP_OK && len == LS_PROFILE_ID_MAX) {
+        err = bsp_storage_get_blob(handle, KEY_PROFILE_ID, out, &len);
+    } else {
+        err = ESP_ERR_INVALID_SIZE;
+    }
+    bsp_storage_close(handle);
+    if (err != ESP_OK) {
+        out[0] = '\0';
+        return false;
+    }
+
+    out[LS_PROFILE_ID_MAX] = '\0';
+    if (!ls_profile_valid(out)) {
+        // A partially written or hand-edited blob must not become a blob path.
+        ESP_LOGW(TAG, "profile id 损坏,忽略");
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+esp_err_t ls_store_save_profile_id(const char *id)
+{
+    if (!ls_profile_valid(id)) return ESP_ERR_INVALID_ARG;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    nvs_handle_t handle;
+    esp_err_t err = bsp_storage_open(LS_NVS_NAMESPACE, &handle);
+    if (err == ESP_OK) {
+        err = bsp_storage_set_blob(handle, KEY_PROFILE_ID, id,
+                                   LS_PROFILE_ID_MAX);
+        if (err == ESP_OK) err = bsp_storage_commit(handle);
+        bsp_storage_close(handle);
+    }
+    return err;
+}
+
+esp_err_t ls_store_clear_profile_id(void)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t handle;
+    esp_err_t err = bsp_storage_open(LS_NVS_NAMESPACE, &handle);
+    if (err != ESP_OK) return err;
+    err = bsp_storage_erase(handle, KEY_PROFILE_ID);
+    if (err == ESP_OK) err = bsp_storage_erase(handle, KEY_BUDDY);
+    if (err == ESP_OK) err = bsp_storage_commit(handle);
+    bsp_storage_close(handle);
+    return err;
+}
+
+bool ls_store_load_buddy(ls_buddy_t *out)
+{
+    if (!out) return false;
+    if (!s_ready) return false;
+
+    char buf[LS_BUDDY_TEXT_MAX];
+    nvs_handle_t handle;
+    if (bsp_storage_open(LS_NVS_NAMESPACE, &handle) != ESP_OK) return false;
+
+    size_t len = sizeof(buf);
+    esp_err_t err = bsp_storage_get_blob(handle, KEY_BUDDY, buf, &len);
+    bsp_storage_close(handle);
+    if (err != ESP_OK || len == 0 || len > sizeof(buf)) {
+        return false;
+    }
+
+    if (ls_buddy_parse(buf, len, out) != LS_BUDDY_OK) {
+        ESP_LOGW(TAG, "伙伴数据损坏,忽略(旧数据保留在 NVS 中以便排查)");
+        return false;
+    }
+    return true;
+}
+
+esp_err_t ls_store_save_buddy(const ls_buddy_t *buddy)
+{
+    if (!buddy) return ESP_ERR_INVALID_ARG;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    char buf[LS_BUDDY_TEXT_MAX];
+    size_t len = 0;
+    if (ls_buddy_write(buddy, buf, sizeof(buf), &len) != LS_BUDDY_OK) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = bsp_storage_open(LS_NVS_NAMESPACE, &handle);
+    if (err == ESP_OK) {
+        err = bsp_storage_set_blob(handle, KEY_BUDDY, buf, len);
+        if (err == ESP_OK) err = bsp_storage_commit(handle);
+        bsp_storage_close(handle);
+    }
     return err;
 }

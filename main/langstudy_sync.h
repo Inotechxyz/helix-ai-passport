@@ -1,7 +1,10 @@
 // main/langstudy_sync.h
-// Optional progress sync. The device POSTs its LSPROG document to a
-// user-configured URL; the server merges per-word revisions and returns the
-// merged LSPROG document. The caller re-merges (idempotent) and persists.
+// Progress sync through Azure Blob Storage.
+//
+// The device GETs profiles/<profile-id>/progress.lsprog from the container
+// configured with a SAS URL, merges it with the local snapshot (local wins
+// ties), then PUTs the merged document back. A missing blob is the first sync
+// for that profile: the merged document is simply the local one.
 #pragma once
 
 #include "langstudy_model.h"
@@ -14,9 +17,16 @@
 
 #define LS_SYNC_DEFAULT_TIMEOUT_MS 20000
 
-// Requires an active Wi-Fi connection. The URL may be http:// (LAN) or
-// https:// (validated against the certificate bundle).
-esp_err_t ls_sync_exchange(const char *url, uint32_t pack_crc,
-                           const ls_progress_t *local,
-                           ls_progress_t *remote,
-                           uint32_t timeout_ms);
+typedef struct {
+    bool remote_found;  // the blob already existed
+    bool created;       // this call uploaded the first copy
+    int http_status;    // last Azure HTTP status, 0 for transport failures
+} ls_sync_result_t;
+
+// Requires an active Wi-Fi connection and a synced clock. container_sas is the
+// HTTPS container SAS URL from Phone Setup; profile_id is a lowercase UUIDv4.
+// On success `remote` holds the merged snapshot the caller should merge again
+// and persist. The SAS is never logged.
+esp_err_t ls_sync_exchange(const char *container_sas, const char *profile_id,
+                           const ls_progress_t *local, ls_progress_t *remote,
+                           ls_sync_result_t *result, uint32_t timeout_ms);

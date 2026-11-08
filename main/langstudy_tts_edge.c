@@ -1,13 +1,15 @@
 // main/langstudy_tts_edge.c
 //
 // Edge streams MPEG-2 Layer III, 24 kHz mono, 48 kbit/s over a WebSocket: one
-// frame is 576 samples and 144 bytes, sent in 720-byte audio payloads. The
-// bytes are decoded as they arrive and written straight to the codec, so no
-// whole-phrase receive buffer is needed. The codec is opened at the stream's own
-// 24 kHz: converting it to the synthesizer's 16 kHz folded the top octave back
-// into the voice as audible hiss. On the ESP32-C3 the heap is so tight that the
-// decoder, its scratch and the codec's DMA all have to fit next to the open TLS
-// session, which is why every buffer here is sized exactly.
+// frame is 576 samples and 144 bytes, sent in 720-byte audio payloads. A phrase
+// is compressed enough to hold whole (16 KiB covers many seconds of speech), so
+// this collects the MP3 bytes while TLS is up, tears TLS down, and only then
+// opens the codec and allocates the decoder. That ordering matters on the
+// ESP32-C3: with TLS live, each incoming ~4 KiB record needs a 4.4 KiB mbedTLS
+// buffer, which does not fit next to the 16 KiB decoder scratch and the codec's
+// DMA buffers. The codec is opened at the stream's own 24 kHz: converting it to
+// the synthesizer's 16 kHz folded the top octave back into the voice as audible
+// hiss.
 #include "langstudy_tts_edge.h"
 
 #include "langstudy_audio.h"
@@ -28,6 +30,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <lwip/sockets.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -70,7 +73,10 @@
 #define EDGE_OUT_MAX 640
 
 typedef struct {
-    mp3dec_t decoder;
+    // The 6.7 KiB decoder state is a separate allocation: after the 16 KiB
+    // scratch is taken, the heap's largest hole can be smaller than the old
+    // combined 10.9 KiB struct while still fitting each part on its own.
+    mp3dec_t *decoder;
     int16_t pcm[EDGE_PCM_MAX];
     int16_t out[EDGE_OUT_MAX];
     ls_resampler_t resampler;
@@ -80,11 +86,12 @@ typedef struct {
     uint8_t mp3[EDGE_MP3_MAX];
 } edge_decoder_t;
 
-// Both are taken together right after the WebSocket upgrade, where the heap
-// still offers one ~32 KB block (scratch 16,256 + decoder ~9.8 KB). Taking them
-// after the TLS session closes does not work: the handshake leaves a single
-// 20 KB hole, too small for the scratch.
+// Taken right after the WebSocket upgrade, before the codec's DMA buffers are
+// reopened. The scratch is allocated first because it is the largest request;
+// the decoder state and then the per-frame buffers follow, so each can land in
+// its own hole instead of requiring one 27 KB contiguous block.
 static edge_decoder_t *s_decoder;
+static mp3dec_t *s_mp3dec;
 static mp3dec_scratch_t *s_scratch;
 
 static void log_alloc_failure(const char *what, size_t bytes)
@@ -94,24 +101,61 @@ static void log_alloc_failure(const char *what, size_t bytes)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 }
 
+// The decoder state (6.6 KiB) and the frame buffers (~4.2 KiB) no longer have
+// to be contiguous. Try the harder request first, then retry the other way
+// around: which order fits depends on where the heap happens to have holes.
+static bool alloc_decoder_pair(void)
+{
+    s_mp3dec = (mp3dec_t *)calloc(1, sizeof(*s_mp3dec));
+    if (s_mp3dec) {
+        s_decoder = (edge_decoder_t *)calloc(1, sizeof(*s_decoder));
+        if (s_decoder) return true;
+        free(s_mp3dec);
+        s_mp3dec = NULL;
+    }
+
+    s_decoder = (edge_decoder_t *)calloc(1, sizeof(*s_decoder));
+    if (!s_decoder) {
+        log_alloc_failure("MP3 帧缓冲", sizeof(*s_decoder));
+        return false;
+    }
+    s_mp3dec = (mp3dec_t *)calloc(1, sizeof(*s_mp3dec));
+    if (!s_mp3dec) {
+        free(s_decoder);
+        s_decoder = NULL;
+        log_alloc_failure("MP3 解码状态", sizeof(*s_mp3dec));
+        return false;
+    }
+    return true;
+}
+
+// The scratch is the one request that needs a 16 KiB contiguous hole. Reserve
+// it as early as possible; see the call site in edge_fetch().
+static bool reserve_scratch(void)
+{
+    if (s_scratch) return true;
+    s_scratch = mp3dec_scratch_alloc();
+    if (!s_scratch) {
+        log_alloc_failure("MP3 解码缓冲", 16256);  // sizeof(mp3dec_scratch_t)
+        return false;
+    }
+    return true;
+}
+
 bool ls_edge_tts_reserve(void)
 {
-    // Largest first: the decoder then lands in the block the scratch could not
-    // fully consume.
-    if (!s_scratch) {
-        s_scratch = mp3dec_scratch_alloc();
-        if (!s_scratch) {
-            log_alloc_failure("MP3 解码缓冲", 16256);  // sizeof(mp3dec_scratch_t)
-            return false;
-        }
+    // Largest first: the scratch is the request that needs the biggest hole.
+    if (!reserve_scratch()) return false;
+    if (!s_mp3dec || !s_decoder) {
+        // A partial pair from an earlier attempt cannot be reused; the retry
+        // below needs both holes free at once.
+        free(s_decoder);
+        s_decoder = NULL;
+        free(s_mp3dec);
+        s_mp3dec = NULL;
+        if (!alloc_decoder_pair()) return false;
     }
-    if (!s_decoder) {
-        s_decoder = (edge_decoder_t *)calloc(1, sizeof(*s_decoder));
-        if (!s_decoder) {
-            log_alloc_failure("MP3 解码状态", sizeof(*s_decoder));
-            return false;
-        }
-    }
+    s_decoder->decoder = s_mp3dec;
     return true;
 }
 
@@ -119,6 +163,8 @@ void ls_edge_tts_unreserve(void)
 {
     free(s_decoder);
     s_decoder = NULL;
+    free(s_mp3dec);
+    s_mp3dec = NULL;
     if (s_scratch) {
         mp3dec_scratch_free(s_scratch);
         s_scratch = NULL;
@@ -191,7 +237,7 @@ typedef struct {
 } ws_payload_t;
 
 static bool ws_read_frame_header(esp_tls_t *tls, ws_payload_t *payload,
-                                 uint8_t *opcode)
+                                 uint8_t *opcode, bool *fin)
 {
     uint8_t head[14];
     if (!tls_read_exact(tls, head, 2)) return false;
@@ -213,6 +259,7 @@ static bool ws_read_frame_header(esp_tls_t *tls, ws_payload_t *payload,
     payload->masked = header.masked;
     memcpy(payload->mask, header.mask, sizeof(payload->mask));
     *opcode = header.opcode;
+    *fin = header.fin;
     return true;
 }
 
@@ -311,7 +358,7 @@ static void drain_mp3(edge_decoder_t *dec, mp3dec_scratch_t *scratch,
 
         mp3dec_frame_info_t info;
         int samples = mp3dec_decode_frame_with_scratch(
-            &dec->decoder, scratch, frame, (int)avail, dec->pcm, &info);
+            dec->decoder, scratch, frame, (int)avail, dec->pcm, &info);
         // A validated header fixes this frame's length, whether minimp3
         // managed to decode it or not.
         offset += (size_t)frame_len;
@@ -366,29 +413,82 @@ static void drain_mp3(edge_decoder_t *dec, mp3dec_scratch_t *scratch,
     }
 }
 
-// Attach the Edge audio bytes of one binary frame to the MP3 assembler.
-static bool stream_audio(ws_payload_t *payload, edge_decoder_t *dec,
-                         ls_edge_cancel_fn cancelled)
+// One spoken word is under a second of 48 kbit/s audio (~6 KiB); 16 KiB
+// covers a slow two-and-a-half second phrase. The compressed phrase is
+// collected while TLS is up and only decoded after the session is closed, so
+// the codec DMA, the 16 KiB MP3 scratch and mbedTLS never compete for the same
+// heap. Streaming all three at once left mbedTLS without its ~4.4 KiB
+// per-record buffer and truncated words mid-syllable.
+#define EDGE_PHRASE_MAX (16 * 1024)
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} phrase_t;
+
+static bool phrase_reserve(phrase_t *phrase, size_t need)
+{
+    if (need <= phrase->cap) return true;
+    size_t cap = phrase->cap ? phrase->cap : 4096;
+    while (cap < need) cap *= 2;
+    if (cap > EDGE_PHRASE_MAX) cap = EDGE_PHRASE_MAX;
+    if (need > cap) return false;
+    uint8_t *grown = (uint8_t *)realloc(phrase->data, cap);
+    if (!grown) return false;
+    phrase->data = grown;
+    phrase->cap = cap;
+    return true;
+}
+
+// Collect the Edge audio bytes of one binary frame. Returns false only when
+// the phrase exceeds EDGE_PHRASE_MAX; the caller then plays what it has.
+static bool phrase_append(ws_payload_t *payload, phrase_t *phrase)
 {
     while (payload->remaining > 0) {
+        size_t room = EDGE_PHRASE_MAX - phrase->len;
+        if (room == 0) {
+            ESP_LOGW(TAG, "在线语音超过 %d 字节,截断", EDGE_PHRASE_MAX);
+            return false;
+        }
+        size_t chunk = payload->remaining < room ? payload->remaining : room;
+        if (!phrase_reserve(phrase, phrase->len + chunk)) return false;
+        if (!ws_payload_read(payload, phrase->data + phrase->len, chunk)) {
+            return false;
+        }
+        phrase->len += chunk;
+    }
+    return true;
+}
+
+// Decode a complete buffered phrase into the codec. Nothing is allocated here.
+static bool decode_phrase(edge_decoder_t *dec, mp3dec_scratch_t *scratch,
+                          const uint8_t *mp3, size_t len,
+                          ls_edge_cancel_fn cancelled)
+{
+    size_t offset = 0;
+    while (offset < len) {
+        if (cancelled && cancelled()) return true;
         size_t space = EDGE_MP3_MAX - dec->mp3_len;
         if (space == 0) {
             ESP_LOGW(TAG, "MP3 组帧缓冲溢出");
             return false;
         }
-        size_t chunk = payload->remaining < space ? payload->remaining : space;
-        if (!ws_payload_read(payload, dec->mp3 + dec->mp3_len, chunk)) {
-            return false;
-        }
+        size_t chunk = len - offset < space ? len - offset : space;
+        memcpy(dec->mp3 + dec->mp3_len, mp3 + offset, chunk);
         dec->mp3_len += chunk;
-        drain_mp3(dec, s_scratch, cancelled);
+        offset += chunk;
+        drain_mp3(dec, scratch, cancelled);
     }
+    // A complete final frame is decoded here; an incomplete tail is dropped.
+    if (dec->mp3_len > 0) drain_mp3(dec, scratch, cancelled);
     return true;
 }
 
-// Open the WebSocket, speak `ssml`, and decode the audio while it arrives. The
-// TLS session is always destroyed before returning, whether the exchange
-// succeeded or not.
+// Open the WebSocket, collect the compressed phrase, close TLS, then decode
+// it. Buffering the phrase is what keeps this inside the ESP32-C3's heap: the
+// codec's DMA buffers and the 16 KiB MP3 scratch are allocated only after the
+// TLS session (and its per-record mbedTLS buffers) is gone.
 static bool edge_fetch(const char *request, size_t request_len,
                        const char *config, const char *ssml,
                        ls_edge_cancel_fn cancelled)
@@ -410,7 +510,7 @@ static bool edge_fetch(const char *request, size_t request_len,
 
     bool complete = false;
     bool cancel_hit = false;
-    bool stream_open = false;
+    phrase_t phrase = { 0 };
     edge_decoder_t *dec = NULL;
 
     if (!tls_write_all(tls, request, request_len)) goto done;
@@ -435,37 +535,50 @@ static bool edge_fetch(const char *request, size_t request_len,
         goto done;
     }
 
-    // Certificate verification is the handshake's peak memory point, so the
-    // handshake above ran with the codec released and no decode buffers held.
-    ESP_LOGI(TAG, "WS 升级完成,分配解码缓冲: 剩余堆=%u 最大连续=%u",
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-    if (!ls_edge_tts_reserve() || !s_decoder || !s_scratch) goto done;
-    ESP_LOGI(TAG, "解码缓冲已分配: 剩余堆=%u 最大连续=%u, DMA 堆=%u 最大连续=%u",
+    ESP_LOGI(TAG, "WS 升级完成,剩余堆=%u 最大连续=%u, DMA 堆=%u 最大连续=%u",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
-    dec = s_decoder;
-    memset(dec, 0, sizeof(*dec));
-    mp3dec_init(&dec->decoder);
+    int sockfd = -1;
+    if (esp_tls_get_conn_sockfd(tls, &sockfd) == ESP_OK && sockfd >= 0) {
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+        if (getpeername(sockfd, (struct sockaddr *)&peer, &peer_len) == 0) {
+            ESP_LOGI(TAG, "服务端 IP: %s", inet_ntoa(peer.sin_addr));
+        }
+    }
 
-    // The codec was released so its DMA buffers did not crowd the handshake.
-    // It has to be open before the first frame arrives.
-    ls_audio_resume();
-    if (ls_audio_stream_begin_rate(EDGE_PLAYBACK_RATE) != ESP_OK) {
-        ESP_LOGW(TAG, "音频设备不可用: 剩余堆=%u 最大连续=%u, DMA 堆=%u 最大连续=%u",
-                 (unsigned)esp_get_free_heap_size(),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    // Take the 16 KiB scratch now, while the handshake's largest hole is still
+    // whole. Taking it after TLS closes is hit-or-miss: the heap is bigger then
+    // but fragmented, and about one word in five found no contiguous 16 KiB and
+    // fell back to the local synthesizer. While downloading, the only other
+    // consumer is mbedTLS's per-record buffer (~4.4 KiB), which still fits in
+    // the holes left after this allocation.
+    if (!reserve_scratch()) {
+        ESP_LOGW(TAG, "下载期间无法预留解码缓冲, 稍后重试");
+    }
+
+    // A newer word may have replaced this one while the handshake ran; do not
+    // spend a synthesis request on it.
+    if (cancelled && cancelled()) {
+        ESP_LOGI(TAG, "在线语音已取消");
+        cancel_hit = true;
         goto done;
     }
-    stream_open = true;
 
     if (!send_text_frame(tls, config)) goto done;
     if (!send_text_frame(tls, ssml)) goto done;
+
+    // Edge sometimes splits one audio message across several WebSocket frames
+    // (FIN=0, then opcode 0x0 continuations). The Edge header appears only on
+    // the first fragment, so continuations are appended as raw MP3. Ignoring
+    // them played only the first ~0.6 s of the word even though turn.end had
+    // arrived, which is why the same word was sometimes short and sometimes
+    // whole.
+    uint8_t msg_opcode = 0;
+    bool msg_is_audio = false;
 
     for (;;) {
         if (cancelled && cancelled()) {
@@ -475,30 +588,61 @@ static bool edge_fetch(const char *request, size_t request_len,
         }
 
         ws_payload_t payload;
-        uint8_t opcode = 0;
-        if (!ws_read_frame_header(tls, &payload, &opcode)) break;
+        uint8_t raw_opcode = 0;
+        bool fin = false;
+        if (!ws_read_frame_header(tls, &payload, &raw_opcode, &fin)) break;
+
+        bool first = raw_opcode != LS_WS_OPCODE_CONTINUATION;
+        uint8_t opcode = first ? raw_opcode : msg_opcode;
+        // Control frames may be interleaved between fragments; they neither
+        // start nor resume a data message, so leave msg_opcode alone.
+        if (first && (opcode == LS_WS_OPCODE_BINARY ||
+                      opcode == LS_WS_OPCODE_TEXT)) {
+            msg_opcode = opcode;
+        }
+        if (opcode == LS_WS_OPCODE_BINARY && (first || !fin)) {
+            ESP_LOGI(TAG, "音频帧: fin=%d 长度=%u 首帧=%d", (int)fin,
+                     (unsigned)payload.remaining, (int)first);
+        }
 
         if (opcode == LS_WS_OPCODE_BINARY) {
-            // Payload is [2-byte header length][Edge header][MP3 bytes...].
-            uint8_t len_bytes[2];
-            if (!ws_payload_read(&payload, len_bytes, 2)) break;
-            size_t header_len = ((size_t)len_bytes[0] << 8) | len_bytes[1];
+            bool is_audio;
+            if (first) {
+                // Payload starts with [2-byte header length][Edge header].
+                uint8_t len_bytes[2];
+                if (!ws_payload_read(&payload, len_bytes, 2)) break;
+                size_t header_len = ((size_t)len_bytes[0] << 8) | len_bytes[1];
 
-            uint8_t edge_hdr[EDGE_HEADER_MAX];
-            size_t want = header_len < sizeof(edge_hdr) ? header_len
-                                                        : sizeof(edge_hdr);
-            if (!ws_payload_read(&payload, edge_hdr, want)) break;
-            bool is_audio = false;
-            for (size_t i = 0; i + 10 <= want; i++) {
-                if (memcmp(edge_hdr + i, "Path:audio", 10) == 0) {
-                    is_audio = true;
-                    break;
+                uint8_t edge_hdr[EDGE_HEADER_MAX];
+                size_t want = header_len < sizeof(edge_hdr) ? header_len
+                                                            : sizeof(edge_hdr);
+                if (!ws_payload_read(&payload, edge_hdr, want)) break;
+                is_audio = false;
+                for (size_t i = 0; i + 10 <= want; i++) {
+                    if (memcmp(edge_hdr + i, "Path:audio", 10) == 0) {
+                        is_audio = true;
+                        break;
+                    }
                 }
+                if (!ws_payload_discard(&payload, header_len - want)) break;
+                msg_is_audio = is_audio;
+                ESP_LOGI(TAG, "头=%u 读到=%u 音频=%d 负载=%u", (unsigned)header_len,
+                         (unsigned)want, (int)is_audio,
+                         (unsigned)payload.remaining);
+            } else {
+                // Continuation of the message started above.
+                is_audio = msg_is_audio;
             }
-            if (!ws_payload_discard(&payload, header_len - want)) break;
 
             if (is_audio) {
-                if (!stream_audio(&payload, dec, cancelled)) break;
+                size_t before = phrase.len;
+                if (!phrase_append(&payload, &phrase)) {
+                    // A phrase longer than any word: play what arrived.
+                    complete = true;
+                    break;
+                }
+                ESP_LOGI(TAG, "追加=%u 累计=%u", (unsigned)(phrase.len - before),
+                         (unsigned)phrase.len);
             } else if (!ws_payload_discard(&payload, payload.remaining)) {
                 break;
             }
@@ -508,6 +652,7 @@ static bool edge_fetch(const char *request, size_t request_len,
                                                            : sizeof(text);
             if (!ws_payload_read(&payload, text, want)) break;
             if (!ws_payload_discard(&payload, payload.remaining)) break;
+            ESP_LOGI(TAG, "文本帧: %.*s", (int)want, (const char *)text);
             bool end = false;
             for (size_t i = 0; i + 8 <= want; i++) {
                 if (memcmp(text + i, "turn.end", 8) == 0) {
@@ -540,20 +685,55 @@ static bool edge_fetch(const char *request, size_t request_len,
     }
 
 done:
-    if (stream_open) {
-        // Last chance for a frame that only became decodable at the very end.
-        drain_mp3(dec, s_scratch, cancelled);
-        ls_audio_stream_end();
+    if (!complete && !cancel_hit) {
+        ESP_LOGW(TAG, "语音下载提前结束: 已收 %u 字节",
+                 (unsigned)phrase.len);
     }
 
-    // Best-effort close frame before tearing the TLS session down.
-    uint8_t mask[4];
+    // Best-effort close frame while the session is still open.
+    uint8_t close_mask[4];
     uint8_t close_frame[8];
-    random_bytes(mask, sizeof(mask));
-    size_t close_len = ls_ws_build_frame(LS_WS_OPCODE_CLOSE, NULL, 0, mask,
-                                         close_frame, sizeof(close_frame));
+    random_bytes(close_mask, sizeof(close_mask));
+    size_t close_len = ls_ws_build_frame(LS_WS_OPCODE_CLOSE, NULL, 0,
+                                         close_mask, close_frame,
+                                         sizeof(close_frame));
     if (close_len > 0) (void)tls_write_all(tls, close_frame, close_len);
+
     esp_tls_conn_destroy(tls);
+    ESP_LOGI(TAG, "TLS 关闭后堆=%u 最大连续=%u, 语音数据=%u 字节, 完整=%d",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+             (unsigned)phrase.len, (int)complete);
+
+    if (!cancel_hit && phrase.len > 0) {
+        // TLS is gone: the codec DMA and the decoder get the whole heap.
+        ls_audio_resume();
+        if (ls_audio_stream_begin_rate(EDGE_PLAYBACK_RATE) != ESP_OK) {
+            ESP_LOGW(TAG, "音频设备不可用: 剩余堆=%u 最大连续=%u, DMA 堆=%u 最大连续=%u",
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        } else if (!ls_edge_tts_reserve() || !s_decoder || !s_mp3dec ||
+                   !s_scratch) {
+            ls_audio_stream_end();
+        } else {
+            dec = s_decoder;
+            memset(dec, 0, sizeof(*dec));
+            dec->decoder = s_mp3dec;
+            mp3dec_init(dec->decoder);
+            ESP_LOGI(TAG, "解码缓冲已分配: 剩余堆=%u 最大连续=%u, DMA 堆=%u 最大连续=%u",
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+            (void)decode_phrase(dec, s_scratch, phrase.data, phrase.len,
+                                cancelled);
+            ls_audio_stream_end();
+        }
+    }
+
+    free(phrase.data);
 
     if (dec && dec->written > 0) {
         ESP_LOGI(TAG, "在线语音播放完成 (%u 采样)", (unsigned)dec->written);
@@ -578,6 +758,8 @@ static bool edge_play_once(const char *text, ls_edge_cancel_fn cancelled)
         ESP_LOGW(TAG, "系统时间未同步,无法生成在线语音令牌");
         return false;
     }
+
+    ESP_LOGI(TAG, "在线合成: \"%s\" (%u 字符)", text, (unsigned)strlen(text));
 
     char token[LS_EDGE_GEC_TOKEN_LEN + 1];
     if (!ls_edge_gec_token((uint64_t)time(NULL), token)) return false;
@@ -652,9 +834,10 @@ static bool edge_play_once(const char *text, ls_edge_cancel_fn cancelled)
         request_id, timestamp, escaped);
     if (ssml_len <= 0 || (size_t)ssml_len >= sizeof(ssml)) return false;
 
-    ESP_LOGI(TAG, "连接前堆=%u 最大连续=%u",
+    ESP_LOGI(TAG, "连接前堆=%u 最大连续=%u, 时间戳=%s, SSML=%d 字节",
              (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+             timestamp, ssml_len);
 
     bool spoken = edge_fetch(request, (size_t)request_len, config, ssml,
                              cancelled);

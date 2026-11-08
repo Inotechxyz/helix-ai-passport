@@ -262,10 +262,12 @@ ls_status_t ls_progress_parse(const char *text, size_t len, ls_progress_t *out)
     return progress_valid(out) ? LS_OK : LS_ERR_FORMAT;
 }
 
-ls_status_t ls_progress_write(const ls_progress_t *progress,
-                              char *out, size_t cap, size_t *out_len)
+// Shared by ls_progress_write() and ls_progress_write_size(); `out == NULL`
+// measures the document without producing it.
+static ls_status_t progress_write(const ls_progress_t *progress, char *out,
+                                  size_t cap, size_t *out_len)
 {
-    if (!progress || !out || !out_len) return LS_ERR_ARG;
+    if (!progress || !out_len) return LS_ERR_ARG;
     *out_len = 0;
     if (!progress_valid(progress)) return LS_ERR_FORMAT;
 
@@ -285,8 +287,10 @@ ls_status_t ls_progress_write(const ls_progress_t *progress,
 
 #define APPEND_LINE()                                                        \
     do {                                                                     \
-        if (used + len > cap) return LS_ERR_SIZE;                            \
-        memcpy(out + used, line, len);                                       \
+        if (out) {                                                           \
+            if (used + len > cap) return LS_ERR_SIZE;                        \
+            memcpy(out + used, line, len);                                   \
+        }                                                                    \
         used += len;                                                         \
         crc = update_crc(crc, line, len);                                    \
     } while (0)
@@ -311,13 +315,28 @@ ls_status_t ls_progress_write(const ls_progress_t *progress,
                        (unsigned long)~crc);
     if (written < 0 || (size_t)written >= sizeof(line)) return LS_ERR_SIZE;
     len = (size_t)written;
-    if (used + len > cap) return LS_ERR_SIZE;
-    memcpy(out + used, line, len);
+    if (out) {
+        if (used + len > cap) return LS_ERR_SIZE;
+        memcpy(out + used, line, len);
+    }
     used += len;
     *out_len = used;
     return LS_OK;
 
 #undef APPEND_LINE
+}
+
+ls_status_t ls_progress_write(const ls_progress_t *progress,
+                              char *out, size_t cap, size_t *out_len)
+{
+    if (!out) return LS_ERR_ARG;
+    return progress_write(progress, out, cap, out_len);
+}
+
+ls_status_t ls_progress_write_size(const ls_progress_t *progress,
+                                   size_t *out_len)
+{
+    return progress_write(progress, NULL, 0, out_len);
 }
 
 static size_t pack_word_count(const ls_pack_t *pack)

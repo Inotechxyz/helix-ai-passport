@@ -33,6 +33,7 @@ typedef struct {
     ls_config_t config;
     uint32_t pack_crc;
     ls_progress_t *progress;  // owned by the worker for SYNC
+    char profile_id[LS_PROFILE_ID_MAX + 1];  // Azure folder for SYNC
     char avoid_words[LS_AVOID_WORDS_MAX];  // active pack + recent history
     uint32_t seed;            // fresh sample selector for this generation
     uint8_t level;            // 1..10 English level start + progress boost
@@ -449,8 +450,13 @@ static void do_sync(online_request_t *request)
         return;
     }
     if (request->config.sync_url[0] == '\0') {
-        post_message(LS_ONLINE_SYNC_FAIL, "Set a sync server URL in setup",
-                     "Phone setup -> sync URL", NULL, NULL, 0);
+        post_message(LS_ONLINE_SYNC_FAIL, "Set the Azure SAS URL in setup",
+                     "Phone setup -> Azure Blob SAS URL", NULL, NULL, 0);
+        return;
+    }
+    if (request->profile_id[0] == '\0') {
+        post_message(LS_ONLINE_SYNC_FAIL, "Create a profile first",
+                     "Menu -> CREATE PROFILE", NULL, NULL, 0);
         return;
     }
     if (!request->progress) {
@@ -464,28 +470,53 @@ static void do_sync(online_request_t *request)
     }
 
     ls_progress_t *remote = (ls_progress_t *)malloc(sizeof(*remote));
+    ls_sync_result_t sync_result;
+    memset(&sync_result, 0, sizeof(sync_result));
     esp_err_t err;
     if (!remote) {
         err = ESP_ERR_NO_MEM;
     } else {
-        err = ls_sync_exchange(request->config.sync_url, request->pack_crc,
-                               request->progress, remote, 0);
+        err = ls_sync_exchange(request->config.sync_url, request->profile_id,
+                               request->progress, remote, &sync_result, 0);
     }
 
     stop_radio();
 
-    // Sync only proves that Wi-Fi and the configured server are reachable, so
-    // only the Wi-Fi icon is updated; DeepSeek stays at its last known state.
+    // Sync only proves that Wi-Fi and the configured container are reachable,
+    // so only the Wi-Fi icon is updated; DeepSeek stays at its last known
+    // state. The SAS URL is a credential and must never reach the screen or
+    // the log, so failures are described by status instead.
     uint8_t wifi_flag = LS_LINK_WIFI_KNOWN | LS_LINK_WIFI_OK;
     if (err == ESP_OK) {
-        post_message(LS_ONLINE_SYNC_OK, "Progress synced", NULL, NULL, remote,
-                     wifi_flag);
+        post_message(LS_ONLINE_SYNC_OK,
+                     sync_result.created ? "First sync uploaded"
+                                         : "Progress synced",
+                     NULL, NULL, remote, wifi_flag);
     } else {
         free(remote);
         char detail[LS_ONLINE_DETAIL_MAX];
-        snprintf(detail, sizeof(detail), "%s: %s", request->config.sync_url,
-                 esp_err_to_name(err));
-        ESP_LOGW(TAG, "同步失败: %s", esp_err_to_name(err));
+        if (sync_result.http_status == 401 ||
+            sync_result.http_status == 403) {
+            snprintf(detail, sizeof(detail),
+                     "Azure rejected the SAS (HTTP %d).\n"
+                     "Generate a new URL.",
+                     sync_result.http_status);
+        } else if (sync_result.http_status == 404) {
+            snprintf(detail, sizeof(detail),
+                     "Azure container not found.\nCheck the SAS URL.");
+        } else if (sync_result.http_status > 0) {
+            snprintf(detail, sizeof(detail), "Azure returned HTTP %d",
+                     sync_result.http_status);
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            snprintf(detail, sizeof(detail), "Clock is not set.\nTry again.");
+        } else if (err == ESP_ERR_INVALID_ARG) {
+            snprintf(detail, sizeof(detail),
+                     "Invalid Azure SAS URL.\nSave it again in setup.");
+        } else {
+            snprintf(detail, sizeof(detail), "%s", esp_err_to_name(err));
+        }
+        ESP_LOGW(TAG, "同步失败: %s (HTTP %d)", esp_err_to_name(err),
+                 sync_result.http_status);
         post_message(LS_ONLINE_SYNC_FAIL, "Sync failed", detail, NULL, NULL,
                      wifi_flag);
     }
@@ -680,6 +711,8 @@ bool ls_online_start(ls_online_op_t op)
         request.progress = (ls_progress_t *)malloc(sizeof(*request.progress));
         if (!request.progress) return false;
         *request.progress = ls_state()->progress;
+        snprintf(request.profile_id, sizeof(request.profile_id), "%s",
+                 ls_state()->profile_id);
     }
 
     s_busy = true;

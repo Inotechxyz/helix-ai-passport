@@ -25,6 +25,7 @@
 #include "langstudy_progress.h"
 #include "langstudy_provision.h"
 #include "langstudy_state.h"
+#include "langstudy_status_cache.h"
 #include "langstudy_store.h"
 #include "langstudy_ui.h"
 
@@ -108,6 +109,13 @@ static void enter_deep_sleep(void)
         ESP_LOGW(TAG, "GPIO wake arm failed: %s", esp_err_to_name(err));
     }
 
+    // The wake is a reset, so the header can only show what was saved here.
+    // Read the gauge while it is still awake, then let it sleep.
+    int soc = bsp_battery_soc();
+    if (soc >= 0) {
+        ls_status_cache_set_soc(soc);
+    }
+
     // CW2017 and ES8311 share I2C: the fuel gauge must finish first.
     (void)bsp_battery_sleep();
     (void)bsp_audio_sleep();
@@ -152,6 +160,20 @@ static bool load_state(void)
         }
     }
 
+    // Deep sleep reboots the chip, so the link markers would otherwise vanish
+    // on every wake until the next online operation. Restore the last result
+    // saved before the previous sleep; a cold boot has no cache and shows
+    // nothing, which is the honest state there.
+    ls_status_cache_t cached;
+    if (ls_status_cache_get(&cached)) {
+        state->wifi_ok = cached.wifi_ok;
+        state->deepseek_ok = cached.deepseek_ok;
+        ESP_LOGI(TAG, "header status restored (wifi=%d deepseek=%d soc=%d)",
+                 (int)cached.wifi_ok, (int)cached.deepseek_ok, cached.soc);
+    } else {
+        ESP_LOGI(TAG, "header status cache empty");
+    }
+
     if (!ls_store_load_pack(&state->pack, &state->store)) {
         ESP_LOGE(TAG, "no usable pack; trying the built-in body directly");
         if (!ls_builtin_load(&state->pack)) return false;
@@ -165,6 +187,30 @@ static bool load_state(void)
         (void)ls_store_load_progress(&state->progress);
     } else {
         ls_progress_init(&state->progress);
+    }
+
+    // The profile id and buddy travel together: creating a profile also picks
+    // a buddy. If the id survived but the buddy record did not (rare NVS
+    // corruption), start a fresh buddy instead of leaving the menu unable to
+    // reach the BUDDY screen.
+    if (state->storage_ready) {
+        (void)ls_store_load_profile_id(state->profile_id,
+                                       sizeof(state->profile_id));
+        state->buddy_valid = ls_store_load_buddy(&state->buddy);
+        if (state->profile_id[0] != '\0' && !state->buddy_valid) {
+            uint32_t hash = 2166136261u;
+            for (const char *p = state->profile_id; *p; p++) {
+                hash = (hash ^ (uint8_t)*p) * 16777619u;
+            }
+            ls_buddy_init(&state->buddy,
+                          (uint8_t)(hash % LS_BUDDY_SPECIES_COUNT),
+                          (uint8_t)((hash >> 8) % LS_BUDDY_NAME_COUNT));
+            state->buddy_valid = true;
+            (void)ls_store_save_buddy(&state->buddy);
+            ESP_LOGW(TAG, "buddy record missing; started a fresh buddy");
+        }
+        ESP_LOGI(TAG, "profile: %s",
+                 state->profile_id[0] ? state->profile_id : "(none)");
     }
 
     // The rolling avoid list survives pack replacement, so repeated refreshes

@@ -337,6 +337,11 @@ static void test_progress_and_session(void)
     // Progress stayed at v1 when packs moved to v2, so on-device records from
     // earlier firmware versions still load.
     CHECK(memcmp(text, "LSPROG|1|", 9) == 0);
+    // The sync path sizes its upload buffer from this count; it must match the
+    // produced document exactly, including the trailing END line.
+    size_t sized = 0;
+    CHECK(ls_progress_write_size(&progress, &sized) == LS_OK);
+    CHECK(sized == len);
     status = ls_progress_parse(text, len, &parsed);
     CHECK(status == LS_OK);
     CHECK(parsed.session_count == progress.session_count);
@@ -908,7 +913,13 @@ static void test_setup_form(void)
     CHECK(!ls_setup_validate_api_key("abc12345"));
     CHECK(!ls_setup_validate_api_key("sk-abc 12345"));
     CHECK(ls_setup_validate_server_url(""));
-    CHECK(ls_setup_validate_server_url("https://example.com:8443/langstudy"));
+    CHECK(ls_setup_validate_server_url(
+        "https://example.blob.core.windows.net/langstudy?sv=2022-11-02"
+        "&sp=rcw&sig=abc%2Bdef%3D"));
+    // The sync URL now carries a SAS credential, so HTTPS and a signature are
+    // both required.
+    CHECK(!ls_setup_validate_server_url("http://example.com/langstudy"));
+    CHECK(!ls_setup_validate_server_url("https://example.com/langstudy"));
     CHECK(!ls_setup_validate_server_url("ftp://example.com"));
     CHECK(!ls_setup_validate_server_url("https://example.com/a b"));
 }

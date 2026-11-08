@@ -13,6 +13,11 @@
 
 bool ls_voice_speak(const char *text, const char *pron);
 
+// Abandon the word being fetched or spoken and drop any queued one. Navigation
+// uses this so a slow online request cannot start talking after the screen has
+// already moved on.
+void ls_voice_stop(void);
+
 esp_err_t ls_voice_init(void);
 void ls_voice_shutdown(void);
 

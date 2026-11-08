@@ -8,6 +8,8 @@
 #include "bsp_display.h"
 #include "langstudy_audio.h"
 #include "langstudy_autoplay.h"
+#include "langstudy_buddy.h"
+#include "langstudy_buddy_sprite.h"
 #include "langstudy_content.h"
 #include "langstudy_gen.h"
 #include "langstudy_online.h"
@@ -16,10 +18,12 @@
 #include "langstudy_provision.h"
 #include "langstudy_session.h"
 #include "langstudy_state.h"
+#include "langstudy_status_cache.h"
 #include "langstudy_store.h"
 #include "langstudy_voice.h"
 
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 
@@ -39,6 +43,10 @@ LV_FONT_DECLARE(langstudy_ipa_16);
 #define LS_IDLE_DIM_MS (30LL * 1000 * 1000)
 #define LS_IDLE_SLEEP_MS (300LL * 1000 * 1000)
 #define LS_BATTERY_PERIOD_MS (30LL * 1000 * 1000)
+// The CW2017 needs a moment after wake before its first conversion; poll it
+// quickly until the first valid reading arrives, then fall back to 30 s.
+#define LS_BATTERY_FAST_MS (2LL * 1000 * 1000)
+#define LS_BATTERY_FAST_TRIES 15
 
 // A warm paper palette with a single red accent, like a passport notebook.
 #define LS_UI_PAPER 0xF7F1E3
@@ -68,6 +76,8 @@ typedef enum {
     LS_VIEW_MENU,
     LS_VIEW_EXAM,
     LS_VIEW_PROGRESS,
+    LS_VIEW_BUDDY,
+    LS_VIEW_PROFILE,
     LS_VIEW_SETTINGS,
     LS_VIEW_STATUS,
     LS_VIEW_DETAIL,
@@ -83,6 +93,8 @@ typedef enum {
 typedef enum {
     LS_MENU_REFRESH = 0,
     LS_MENU_PROGRESS,
+    LS_MENU_BUDDY,
+    LS_MENU_PROFILE,
     LS_MENU_CHECK,
     LS_MENU_SETTINGS,
     LS_MENU_SETUP,
@@ -95,6 +107,8 @@ typedef enum {
 static const char *const s_menu_text[LS_MENU_COUNT] = {
     "REFRESH WORDS",
     "PROGRESS",
+    "BUDDY",
+    "CREATE PROFILE",
     "CONNECTION CHECK",
     "SETTINGS",
     "PHONE SETUP",
@@ -119,6 +133,10 @@ static const char *TAG = "ls_ui";
 // Defined below. The session-complete path may start a refresh automatically
 // once the learner has met every word in the active pack.
 static void start_online(ls_online_op_t op, const char *message);
+// The CREATE PROFILE view and the BUDDY view link to each other, so both need
+// a forward declaration.
+static void show_buddy(const char *note);
+static void create_profile(void);
 
 static lv_obj_t *s_scr;
 static lv_obj_t *s_study;
@@ -151,6 +169,22 @@ static lv_obj_t *s_set_labels[LS_SETTING_COUNT];
 static int s_set_index;
 static bool s_set_adjusting;
 
+// BUDDY view. The 24x24 palette-index art is painted into a 2x canvas, which
+// needs no image decoder and no LVGL heap (LVGL only gets 24 KiB here).
+#define LS_BUDDY_SPRITE_ZOOM 2
+#define LS_BUDDY_CANVAS_W (LS_BUDDY_SPRITE_W * LS_BUDDY_SPRITE_ZOOM)
+#define LS_BUDDY_CANVAS_H (LS_BUDDY_SPRITE_H * LS_BUDDY_SPRITE_ZOOM)
+static uint16_t
+    s_buddy_canvas_buf[LS_BUDDY_CANVAS_W * LS_BUDDY_CANVAS_H]
+        __attribute__((aligned(4)));
+static uint8_t s_profile_name_index;
+
+// Growth earned during the current session, reported on the summary screen.
+static uint32_t s_session_xp;
+static bool s_session_evolved;
+static bool s_session_snack;
+static lv_obj_t *s_profile_name_label;
+
 #define LS_PROGRESS_ROWS 2
 enum { LS_PROGRESS_SYNC = 0, LS_PROGRESS_BACK };
 static lv_obj_t *s_progress_rows[LS_PROGRESS_ROWS];
@@ -166,6 +200,8 @@ static char s_detail[LS_ONLINE_DETAIL_MAX];
 static ls_provision_info_t s_prov_info;
 static int64_t s_last_input_ms;
 static int64_t s_battery_ms;
+static bool s_battery_seen;
+static uint8_t s_battery_fast_tries;
 static bool s_dimmed;
 static volatile bool s_sleep_due;
 static ls_view_t s_view = LS_VIEW_STUDY;
@@ -340,6 +376,11 @@ static void start_new_session(void)
         state->prev_session_len, state->session_ids);
     state->session_pos = 0;
     state->session_correct = 0;
+
+    // Reports for the summary screen; the buddy itself keeps its own XP.
+    s_session_xp = 0;
+    s_session_evolved = false;
+    s_session_snack = false;
 }
 
 static void update_study(void)
@@ -430,7 +471,7 @@ static void autoplay_stop_and_refresh(void)
             break;
         }
     }
-    ls_audio_stop();
+    ls_voice_stop();
     update_study();
 }
 
@@ -502,6 +543,26 @@ static void show_summary(void)
                           (unsigned)state->session_len);
     make_text_label(m, 10, 88, 220, 20, &lv_font_montserrat_14,
                     LS_UI_MUTED, "CORRECT ANSWERS");
+
+    if (state->buddy_valid) {
+        char note[72];
+        if (s_session_evolved) {
+            snprintf(note, sizeof(note), "%s EVOLVED TO FORM %u!",
+                     ls_buddy_name(state->buddy.name_id),
+                     (unsigned)(state->buddy.stage + 1));
+        } else if (s_session_xp > 0) {
+            snprintf(note, sizeof(note), "%s +%lu XP%s",
+                     ls_buddy_name(state->buddy.name_id),
+                     (unsigned long)s_session_xp,
+                     s_session_snack ? "  +1 SNACK" : "");
+        } else {
+            snprintf(note, sizeof(note), "%s IS WAITING",
+                     ls_buddy_name(state->buddy.name_id));
+        }
+        make_text_label(m, 8, 112, 224, 22, &lv_font_montserrat_14,
+                        LS_UI_ACCENT, note);
+    }
+
     make_text_label(m, 10, 140, 220, 60, &lv_font_montserrat_14,
                     LS_UI_INK, "OK: NEXT SESSION\nDOWN: MENU");
 }
@@ -515,6 +576,10 @@ static void update_menu(void)
         // The progress screen works offline; only its sync button needs the
         // network, and it explains the missing setup when pressed.
         [LS_MENU_PROGRESS] = true,
+        // The buddy and the profile live entirely on the device; Azure is only
+        // involved when the learner syncs progress.
+        [LS_MENU_BUDDY] = true,
+        [LS_MENU_PROFILE] = true,
         [LS_MENU_CHECK] = true,
         [LS_MENU_SETTINGS] = true,
         [LS_MENU_SETUP] = true,
@@ -563,13 +628,13 @@ static void show_menu(void)
     make_text_label(m, 10, 0, 220, 20, &lv_font_montserrat_14,
                     LS_UI_ACCENT, "MENU");
 
-    // Eight rows: 20 px high on a 22 px pitch keeps the last row above the
-    // key hint at y197.
+    // Ten rows: 16 px high on an 18 px pitch keeps the last row above the key
+    // hint at y202.
     for (int i = 0; i < LS_MENU_COUNT; i++) {
         lv_obj_t *row = lv_obj_create(m);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, 12, 20 + i * 22);
-        lv_obj_set_size(row, 216, 20);
+        lv_obj_set_pos(row, 12, 20 + i * 18);
+        lv_obj_set_size(row, 216, 16);
         lv_obj_set_style_radius(row, 4, 0);
         lv_obj_set_style_border_width(row, 1, 0);
         lv_obj_set_style_border_color(row, lv_color_hex(LS_UI_RULE), 0);
@@ -588,7 +653,7 @@ static void show_menu(void)
         s_menu_labels[i] = label;
     }
 
-    make_text_label(m, 8, 198, 224, 40, &lv_font_montserrat_14,
+    make_text_label(m, 8, 202, 224, 40, &lv_font_montserrat_14,
                     LS_UI_MUTED, "UP/DOWN MOVE\nOK SELECT   HOLD OK BACK");
     update_menu();
 }
@@ -874,7 +939,8 @@ static void show_confirm(void)
     make_text_label(m, 10, 10, 220, 20, &lv_font_montserrat_14,
                     LS_UI_ACCENT, "RESET PROGRESS?");
     make_text_label(m, 12, 50, 216, 50, &lv_font_montserrat_14,
-                    LS_UI_INK, "ALL LEARNING RECORDS WILL BE ERASED.");
+                    LS_UI_INK,
+                    "ALL LEARNING RECORDS AND THE\nBUDDY PROFILE WILL BE ERASED.");
     make_text_label(m, 10, 130, 220, 60, &lv_font_montserrat_14,
                     LS_UI_INK, "OK: YES\nDOWN: NO");
 }
@@ -887,7 +953,8 @@ static bool sync_ready(void)
 {
     ls_state_t *state = ls_state();
     return ls_config_has_wifi(&state->config) &&
-           ls_config_has_sync_url(&state->config);
+           ls_config_has_sync_url(&state->config) &&
+           state->profile_id[0] != '\0';
 }
 
 static unsigned studied_word_count(void)
@@ -991,6 +1058,251 @@ static void show_progress(void)
 }
 
 // ---------------------------------------------------------------------------
+// Digital buddy
+// ---------------------------------------------------------------------------
+
+static void update_profile_name(void)
+{
+    if (!s_profile_name_label) return;
+    s_profile_name_index %= LS_BUDDY_NAME_COUNT;
+    lv_label_set_text(s_profile_name_label,
+                      ls_buddy_name(s_profile_name_index));
+}
+
+static void show_profile(void)
+{
+    ls_state_t *state = ls_state();
+    lv_obj_t *m = begin_modal();
+    s_view = LS_VIEW_PROFILE;
+    s_profile_name_label = NULL;
+
+    make_text_label(m, 10, 0, 220, 20, &lv_font_montserrat_14,
+                    LS_UI_ACCENT, "CREATE PROFILE");
+
+    if (state->profile_id[0] != '\0') {
+        // The id names the Azure folder. Replacing it silently would orphan
+        // the remote copy, so this screen only reports the existing one.
+        make_text_label(m, 10, 32, 220, 20, &lv_font_montserrat_14,
+                        LS_UI_MUTED, "THIS DEVICE ALREADY HAS ONE");
+
+        char first[19];
+        char second[19];
+        memcpy(first, state->profile_id, 18);
+        first[18] = '\0';
+        memcpy(second, state->profile_id + 18, 18);
+        second[18] = '\0';
+        make_text_label(m, 10, 62, 220, 20, &lv_font_montserrat_14,
+                        LS_UI_INK, first);
+        make_text_label(m, 10, 84, 220, 20, &lv_font_montserrat_14,
+                        LS_UI_INK, second);
+        make_text_label(m, 10, 122, 220, 60, &lv_font_montserrat_14,
+                        LS_UI_MUTED,
+                        "RESET PROGRESS REMOVES THE\nPROFILE AND ITS BUDDY.");
+        make_text_label(m, 8, 212, 224, 40, &lv_font_montserrat_14,
+                        LS_UI_MUTED, "OK: BACK");
+        return;
+    }
+
+    make_text_label(m, 10, 28, 220, 20, &lv_font_montserrat_14,
+                    LS_UI_MUTED, "PICK A NAME FOR YOUR BUDDY");
+    s_profile_name_label = make_text_label(m, 10, 58, 220, 34,
+                                           &lv_font_montserrat_28,
+                                           LS_UI_INK, "");
+    update_profile_name();
+    make_text_label(m, 10, 106, 220, 60, &lv_font_montserrat_14,
+                    LS_UI_MUTED,
+                    "OK CREATES A UNIQUE PROFILE ID\nAND A RANDOM BUDDY.");
+    make_text_label(m, 8, 212, 224, 50, &lv_font_montserrat_14,
+                    LS_UI_MUTED, "UP/DOWN NAME\nOK CREATE   HOLD OK BACK");
+}
+
+// Paint the 24x24 palette-index art into the 2x canvas. Index 0 is
+// transparent, so the paper background shows through.
+static void paint_buddy(lv_obj_t *parent, const ls_buddy_t *buddy)
+{
+    const uint8_t *px = ls_buddy_sprite(buddy->species, buddy->stage);
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(canvas, s_buddy_canvas_buf, LS_BUDDY_CANVAS_W,
+                         LS_BUDDY_CANVAS_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_remove_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(canvas, (240 - LS_BUDDY_CANVAS_W) / 2, 14);
+    lv_obj_set_style_pad_all(canvas, 0, 0);
+    lv_obj_set_style_border_width(canvas, 0, 0);
+    lv_obj_set_style_bg_opa(canvas, LV_OPA_TRANSP, 0);
+
+    for (int y = 0; y < LS_BUDDY_SPRITE_H; y++) {
+        for (int x = 0; x < LS_BUDDY_SPRITE_W; x++) {
+            uint8_t index = px[y * LS_BUDDY_SPRITE_W + x];
+            lv_color_t color =
+                index ? lv_color_hex(ls_buddy_palette_color(buddy->species,
+                                                            index))
+                      : lv_color_black();
+            lv_opa_t opa = index ? LV_OPA_COVER : LV_OPA_TRANSP;
+            for (int dy = 0; dy < LS_BUDDY_SPRITE_ZOOM; dy++) {
+                for (int dx = 0; dx < LS_BUDDY_SPRITE_ZOOM; dx++) {
+                    lv_canvas_set_px(canvas,
+                                     x * LS_BUDDY_SPRITE_ZOOM + dx,
+                                     y * LS_BUDDY_SPRITE_ZOOM + dy,
+                                     color, opa);
+                }
+            }
+        }
+    }
+}
+
+static void buddy_bar(lv_obj_t *parent, int y, int permille, uint32_t color)
+{
+    if (permille < 0) permille = 0;
+    if (permille > 1000) permille = 1000;
+    lv_obj_t *track = make_box(parent, 20, y, 200, 8);
+    lv_obj_set_style_radius(track, 4, 0);
+    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(track, lv_color_hex(LS_UI_RULE), 0);
+    lv_obj_t *fill = make_box(parent, 20, y, 200 * permille / 1000, 8);
+    lv_obj_set_style_radius(fill, 4, 0);
+    lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(fill, lv_color_hex(color), 0);
+}
+
+static void show_buddy(const char *note)
+{
+    ls_state_t *state = ls_state();
+    lv_obj_t *m = begin_modal();
+    s_view = LS_VIEW_BUDDY;
+
+    make_text_label(m, 10, 0, 220, 20, &lv_font_montserrat_14,
+                    LS_UI_ACCENT, "BUDDY");
+
+    if (!state->buddy_valid) {
+        make_text_label(m, 12, 90, 216, 100, &lv_font_montserrat_14,
+                        LS_UI_MUTED,
+                        "NO BUDDY YET\n\nCREATE A PROFILE FROM\nTHE MENU");
+        make_text_label(m, 8, 212, 224, 40, &lv_font_montserrat_14,
+                        LS_UI_MUTED, "OK: BACK");
+        return;
+    }
+
+    ls_buddy_t *buddy = &state->buddy;
+    paint_buddy(m, buddy);
+
+    char line[64];
+    snprintf(line, sizeof(line), "%s THE %s",
+             ls_buddy_name(buddy->name_id),
+             ls_buddy_species_name(buddy->species));
+    make_text_label(m, 8, 68, 224, 20, &lv_font_montserrat_14,
+                    LS_UI_INK, line);
+
+    uint32_t next = ls_buddy_next_stage_xp(buddy->stage);
+    if (next == 0) {
+        snprintf(line, sizeof(line), "FORM %u/4   XP %lu  MAX",
+                 (unsigned)buddy->stage + 1, (unsigned long)buddy->xp);
+    } else {
+        snprintf(line, sizeof(line), "FORM %u/4   XP %lu / %lu",
+                 (unsigned)buddy->stage + 1, (unsigned long)buddy->xp,
+                 (unsigned long)next);
+    }
+    make_text_label(m, 8, 90, 224, 20, &lv_font_montserrat_14,
+                    LS_UI_MUTED, line);
+
+    // XP bar toward the next evolution, relative to this stage's floor so it
+    // starts empty after each growth.
+    uint32_t floor = 0;
+    if (buddy->stage == 1) floor = LS_BUDDY_XP_STAGE1;
+    else if (buddy->stage == 2) floor = LS_BUDDY_XP_STAGE2;
+    int xp_permille = 1000;
+    if (next > floor) {
+        xp_permille = (int)((buddy->xp - floor) * 1000u / (next - floor));
+    }
+    buddy_bar(m, 112, xp_permille, LS_UI_ACCENT);
+
+    snprintf(line, sizeof(line), "ENERGY %u%%   SNACKS %u",
+             (unsigned)buddy->energy, (unsigned)buddy->snacks);
+    make_text_label(m, 8, 126, 224, 20, &lv_font_montserrat_14,
+                    LS_UI_MUTED, line);
+    buddy_bar(m, 148, (int)buddy->energy * 10,
+              ls_buddy_is_happy(buddy) ? LS_UI_OK : LS_UI_WARN);
+
+    snprintf(line, sizeof(line), "SKILL: %s",
+             buddy->stage == 0 ? "NONE"
+                               : ls_buddy_skill_name(buddy->stage));
+    make_text_label(m, 8, 162, 224, 20, &lv_font_montserrat_14,
+                    LS_UI_INK, line);
+    make_text_label(m, 8, 180, 224, 20, &lv_font_montserrat_14,
+                    LS_UI_MUTED, ls_buddy_skill_detail(buddy->stage));
+
+    if (note && note[0]) {
+        snprintf(line, sizeof(line), "%s", note);
+    } else if (ls_buddy_is_happy(buddy)) {
+        snprintf(line, sizeof(line), "HAPPY: +25%% XP");
+    } else {
+        snprintf(line, sizeof(line), "FEED TO GET HAPPY");
+    }
+    make_text_label(m, 8, 200, 224, 20, &lv_font_montserrat_14,
+                    LS_UI_ACCENT, line);
+
+    make_text_label(m, 8, 224, 224, 40, &lv_font_montserrat_14,
+                    LS_UI_MUTED, "OK FEED   HOLD OK BACK");
+}
+
+static void create_profile(void)
+{
+    ls_state_t *state = ls_state();
+
+    uint32_t bits[4] = {esp_random(), esp_random(), esp_random(),
+                        esp_random()};
+    char id[LS_PROFILE_ID_MAX + 1];
+    ls_profile_format(bits, id);
+    if (!ls_profile_valid(id)) {
+        show_status("COULD NOT CREATE\nA PROFILE ID", false,
+                    LS_STATUS_NEXT_MENU);
+        return;
+    }
+
+    memcpy(state->profile_id, id, sizeof(state->profile_id));
+    s_profile_name_index %= LS_BUDDY_NAME_COUNT;
+    ls_buddy_init(&state->buddy,
+                  (uint8_t)(esp_random() % LS_BUDDY_SPECIES_COUNT),
+                  s_profile_name_index);
+    state->buddy_valid = true;
+
+    bool saved = false;
+    if (state->storage_ready) {
+        saved = ls_store_save_profile_id(id) == ESP_OK &&
+                ls_store_save_buddy(&state->buddy) == ESP_OK;
+    }
+    ESP_LOGI(TAG, "profile %s created (saved=%d)", id, (int)saved);
+    show_buddy(saved ? "PROFILE CREATED"
+                     : "PROFILE CREATED\nNOT SAVED");
+}
+
+static void feed_buddy(void)
+{
+    ls_state_t *state = ls_state();
+    if (!state->buddy_valid) {
+        show_menu();
+        return;
+    }
+
+    ls_buddy_feed_t result = ls_buddy_feed(&state->buddy);
+    if (result == LS_BUDDY_FED && state->storage_ready) {
+        (void)ls_store_save_buddy(&state->buddy);
+    }
+
+    switch (result) {
+    case LS_BUDDY_FED:
+        show_buddy("FED! +25 ENERGY");
+        break;
+    case LS_BUDDY_ALREADY_FULL:
+        show_buddy("ALREADY FULL");
+        break;
+    case LS_BUDDY_NO_SNACK:
+    default:
+        show_buddy("NO SNACKS LEFT");
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
@@ -1027,12 +1339,38 @@ static void answer_card(bool correct)
         (void)ls_store_save_progress(&state->progress);
     }
 
+    // The buddy earns XP from the same answer. Higher English levels are worth
+    // more, and the per-answer energy drift keeps condition tied to activity.
+    if (state->buddy_valid) {
+        bool evolved = false;
+        s_session_xp += ls_buddy_award(&state->buddy, state->config.level,
+                                       correct, &evolved);
+        if (evolved) s_session_evolved = true;
+        if (state->storage_ready) {
+            (void)ls_store_save_buddy(&state->buddy);
+        }
+    }
+
     state->session_pos++;
-    ls_audio_stop();
+    ls_voice_stop();
     if (state->session_pos >= state->session_len) {
         ls_progress_finish_session(&state->progress);
         if (state->storage_ready) {
             (void)ls_store_save_progress(&state->progress);
+        }
+
+        // Ending a session drains condition and may earn a snack for accuracy.
+        if (state->buddy_valid) {
+            bool evolved = false;
+            bool snack = false;
+            ls_buddy_finish_session(&state->buddy, state->session_correct,
+                                    (uint16_t)state->session_len, &snack,
+                                    &evolved);
+            if (evolved) s_session_evolved = true;
+            if (snack) s_session_snack = true;
+            if (state->storage_ready) {
+                (void)ls_store_save_buddy(&state->buddy);
+            }
         }
         show_summary();
         // 100% completion is the natural moment to replace the pack: the
@@ -1041,6 +1379,12 @@ static void answer_card(bool correct)
         maybe_auto_refresh();
     } else {
         update_study();
+    }
+
+    // ECHO (second evolution): repeat a missed word so the learner hears it
+    // again at the moment of the mistake.
+    if (!correct && state->buddy_valid && state->buddy.stage >= 2) {
+        (void)ls_voice_speak(word->text, word->pron);
     }
 }
 
@@ -1123,6 +1467,9 @@ static void handle_online(ls_online_msg_t *msg)
     if (msg->link_flags & LS_LINK_DEEPSEEK_KNOWN) {
         state->deepseek_ok = (msg->link_flags & LS_LINK_DEEPSEEK_OK) != 0;
     }
+    // Deep sleep resets the flags; save them so the next wake can draw the
+    // header before any online operation runs.
+    ls_status_cache_set_links(state->wifi_ok, state->deepseek_ok);
     update_link_icons();
 
     switch (msg->kind) {
@@ -1186,8 +1533,10 @@ static void activate_progress(void)
     }
     if (!sync_ready()) {
         show_status_titled("SYNC PROGRESS",
-                           "SYNC SERVER NOT SET UP\n\n"
-                           "OPEN PHONE SETUP\nADD WI-FI + SYNC URL",
+                           "SYNC NOT SET UP\n\n"
+                           "ADD WI-FI + AZURE SAS URL\n"
+                           "IN PHONE SETUP, THEN\n"
+                           "CREATE A PROFILE",
                            false, LS_STATUS_NEXT_MENU);
         return;
     }
@@ -1201,7 +1550,7 @@ static void begin_provisioning(void)
 
     // SoftAP + HTTP server need internal RAM; return the I2S/codec buffers
     // first and re-enable playback when provisioning stops.
-    ls_audio_stop();
+    ls_voice_stop();
     (void)ls_audio_release();
 
     esp_err_t err = ls_provision_start(&state->config, &s_prov_info);
@@ -1219,11 +1568,16 @@ static void do_reset(void)
     ls_state_t *state = ls_state();
     ls_progress_init(&state->progress);
     // RESET means a fresh start, including vocabulary that earlier refreshes
-    // pushed away.
+    // pushed away and the profile/buddy identity.
     state->avoid_history[0] = '\0';
+    state->profile_id[0] = '\0';
+    state->buddy_valid = false;
+    memset(&state->buddy, 0, sizeof(state->buddy));
     if (state->storage_ready) {
         (void)ls_store_clear_progress();
         (void)ls_store_clear_avoid_history();
+        // This also erases the buddy record that belongs to the profile.
+        (void)ls_store_clear_profile_id();
     }
     // A fresh start may reuse any word; dropping session_len also stops
     // start_new_session() from carrying the old exclusion list forward.
@@ -1273,6 +1627,12 @@ static void activate_menu(void)
         break;
     case LS_MENU_PROGRESS:
         show_progress();
+        break;
+    case LS_MENU_BUDDY:
+        show_buddy(NULL);
+        break;
+    case LS_MENU_PROFILE:
+        show_profile();
         break;
     case LS_MENU_CHECK:
         start_online(LS_ONLINE_CHECK, "WI-FI / DEEPSEEK\nPLEASE WAIT");
@@ -1339,7 +1699,11 @@ esp_err_t ls_ui_init(void)
     lv_obj_set_style_radius(s_bat_fill, 1, 0);
     lv_obj_set_style_bg_opa(s_bat_fill, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(LS_UI_OK), 0);
-    update_battery_bar(-1);   // unknown until the first gauge read
+    // Paint the value saved before the last sleep so the bar is not blank while
+    // the gauge finishes its first conversion after the wake.
+    ls_status_cache_t cached;
+    (void)ls_status_cache_get(&cached);
+    update_battery_bar(cached.soc);
 
     // Link status sits at the right of the same line. Both icons stay hidden
     // until the corresponding online hop has actually succeeded.
@@ -1423,6 +1787,8 @@ esp_err_t ls_ui_init(void)
 
     s_last_input_ms = esp_timer_get_time();
     s_battery_ms = s_last_input_ms - LS_BATTERY_PERIOD_MS;
+    s_battery_seen = false;
+    s_battery_fast_tries = 0;
     s_dimmed = false;
     s_sleep_due = false;
     s_view = LS_VIEW_STUDY;
@@ -1450,11 +1816,11 @@ void ls_ui_on_key(bsp_btn_t btn, bsp_btn_ev_t ev)
             // so auto-play never scores a card behind the learner's back.
             autoplay_stop_and_refresh();
             if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
-                ls_audio_stop();
+                ls_voice_stop();
                 show_menu();
             }
         } else if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
-            ls_audio_stop();
+            ls_voice_stop();
             show_menu();
         } else if (ev == BSP_BTN_CLICK) {
             if (btn == BSP_BTN_UP) {
@@ -1523,6 +1889,35 @@ void ls_ui_on_key(bsp_btn_t btn, bsp_btn_ev_t ev)
                 update_progress_view();
             } else if (btn == BSP_BTN_OK) {
                 activate_progress();
+            }
+        }
+        break;
+
+    case LS_VIEW_BUDDY:
+        if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
+            show_menu();
+        } else if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) {
+            feed_buddy();
+        }
+        break;
+
+    case LS_VIEW_PROFILE:
+        if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
+            show_menu();
+        } else if (ev == BSP_BTN_CLICK) {
+            if (ls_state()->profile_id[0] != '\0') {
+                if (btn == BSP_BTN_OK) show_menu();
+            } else if (btn == BSP_BTN_UP) {
+                s_profile_name_index =
+                    (uint8_t)((s_profile_name_index + LS_BUDDY_NAME_COUNT - 1) %
+                              LS_BUDDY_NAME_COUNT);
+                update_profile_name();
+            } else if (btn == BSP_BTN_DOWN) {
+                s_profile_name_index =
+                    (uint8_t)((s_profile_name_index + 1) % LS_BUDDY_NAME_COUNT);
+                update_profile_name();
+            } else if (btn == BSP_BTN_OK) {
+                create_profile();
             }
         }
         break;
@@ -1619,7 +2014,18 @@ void ls_ui_tick(void)
     if (now - s_battery_ms >= LS_BATTERY_PERIOD_MS) {
         s_battery_ms = now;
         int soc = bsp_battery_soc();
-        if (bsp_lvgl_lock(200)) {
+        if (soc >= 0) {
+            s_battery_seen = true;
+            ls_status_cache_set_soc(soc);
+        } else if (!s_battery_seen && s_battery_fast_tries < LS_BATTERY_FAST_TRIES) {
+            // Not ready yet (or still asleep). Try again in 2 s instead of
+            // leaving the plain outline up for half a minute.
+            s_battery_fast_tries++;
+            s_battery_ms = now - LS_BATTERY_PERIOD_MS + LS_BATTERY_FAST_MS;
+        }
+        // A failed read keeps the last known fill instead of erasing it, which
+        // matters right after a wake while the chip is still computing.
+        if (soc >= 0 && bsp_lvgl_lock(200)) {
             update_battery_bar(soc);
             bsp_lvgl_unlock();
         }
@@ -1665,7 +2071,9 @@ void ls_ui_tick(void)
 
     bool sleepable_view = (s_view == LS_VIEW_STUDY ||
                            s_view == LS_VIEW_SUMMARY ||
-                           s_view == LS_VIEW_MENU);
+                           s_view == LS_VIEW_MENU ||
+                           s_view == LS_VIEW_BUDDY ||
+                           s_view == LS_VIEW_PROFILE);
     if (sleepable_view && !ls_online_busy() && !ls_provision_active()) {
         int64_t idle = now - s_last_input_ms;
         if (!s_dimmed && idle >= LS_IDLE_DIM_MS) {

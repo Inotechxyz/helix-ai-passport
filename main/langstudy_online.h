@@ -15,7 +15,7 @@
 
 typedef enum {
     LS_ONLINE_REFRESH = 0,   // generate a new 60-word pack via DeepSeek
-    LS_ONLINE_SYNC,          // exchange progress with the sync server
+    LS_ONLINE_SYNC,          // exchange progress with Azure Blob Storage
     LS_ONLINE_CHECK,         // report Wi-Fi and DeepSeek reachability
 } ls_online_op_t;
 

@@ -7,7 +7,7 @@
 `PASSPORT ENGLISH` is an offline-first English study application for the AI
 Passport hardware. Progress lives on the device and survives power loss. When a
 Wi-Fi network is configured, the user may optionally refresh the word pack and
-merge progress with a small sync server.
+sync progress to Azure Blob Storage.
 
 The application replaces the demo menu and demo pages. `main/main.c` only calls
 `ls_app_start()`; all input and state handling lives in `langstudy_app.c`, and
@@ -34,7 +34,7 @@ the notebook-style screens live in `langstudy_ui.c`. Hardware access stays in
 | BSP | `components/bsp` | Display, buttons, battery, audio, I2C, storage wrappers, sleep preparation. |
 | Pure logic | `main/langstudy_*.c` | Pack/progress parsers, scheduling, phonemes, synthesis, JSON, prompt extraction, setup-form validation. Host-testable without ESP-IDF. |
 | Application | `main/langstudy_app.c`, `main/langstudy_ui.c` | Boot order, input task, screens, deep sleep, orchestration of online results. |
-| Services | `main/langstudy_provision.c`, `langstudy_deepseek.c`, `langstudy_sync.c`, `langstudy_online.c` | SoftAP setup page, DeepSeek HTTP, progress sync, background work queue. |
+| Services | `main/langstudy_provision.c`, `langstudy_deepseek.c`, `langstudy_sync.c`, `langstudy_online.c` | SoftAP setup page, DeepSeek HTTP, Azure progress sync, background work queue. |
 
 Pack and progress mutation happens on the application input task. Background
 services post heap-owned results through `ls_online_poll()`, and the UI frees
@@ -59,29 +59,76 @@ card when the bar empties. The dwell defaults to 5 seconds and is set with
 auto-play without scoring; a long OK leaves auto-play and opens the menu. The
 mode is never persisted across a reboot.
 
-Menu entries: `REFRESH WORDS`, `PROGRESS`, `CONNECTION CHECK`,
-`SETTINGS`, `PHONE SETUP`, `NEW SESSION`, `RESET PROGRESS`, `BACK`. Choosing
-`REFRESH WORDS` opens a vocabulary-tier list (`CET4`, `CET6`, `IELTS`). Entries
-that need a network show `(SETUP)` and explain what is missing instead of
-failing silently.
+Menu entries: `REFRESH WORDS`, `PROGRESS`, `BUDDY`, `CREATE PROFILE`,
+`CONNECTION CHECK`, `SETTINGS`, `PHONE SETUP`, `NEW SESSION`, `RESET PROGRESS`,
+`BACK`. Choosing `REFRESH WORDS` opens a vocabulary-tier list (`CET4`, `CET6`,
+`IELTS`). Entries that need a network show `(SETUP)` and explain what is missing
+instead of failing silently.
 
 `PROGRESS` is always available, even offline. It shows the completed session
 count, the answered-card count, the accuracy percentage, how many words in the
 current pack have been studied, and the completion percentage. `SYNC NOW` is
-offered only when a sync URL is configured; otherwise the row reads
-`SYNC NOW (SETUP)` and explains the missing URL instead of starting a doomed
-request. Failed status screens show `DOWN: DETAIL` when the worker recorded a
+offered only when Wi-Fi, an Azure container SAS URL, and a profile exist;
+otherwise the row reads `SYNC NOW (SETUP)` and explains what is missing instead
+of starting a doomed request. Failed status screens show `DOWN: DETAIL` when the worker recorded a
 diagnostic, and pressing DOWN opens an error-detail page with the HTTP status,
 usable-byte count, repeated words, or HTTPS error.
 
 The study screen header is a single line: `PASSPORT ENGLISH`, a vertical battery
 bar (filled from the bottom in proportion to the charge; green, amber below 30%,
-red below 15%, and an empty outline until the fuel gauge reports a value), a
-Wi-Fi icon, and a `D` badge for DeepSeek. The Wi-Fi and `D` icons appear once a check or refresh has proven
-each hop. Both stay hidden until a result is known, and a later offline
-operation does not clear a green icon learned from an earlier check. They report
-the last known state rather than a live connection: the radio is torn down after
-every online operation.
+red below 15%, and an empty outline when the fuel gauge has never reported a
+value), a Wi-Fi icon, and a `D` badge for DeepSeek. The Wi-Fi and `D` icons
+appear once a check or refresh has proven each hop. Both stay hidden until a
+result is known, and a later offline operation does not clear a green icon
+learned from an earlier check. They report the last known state rather than a
+live connection: the radio is torn down after every online operation.
+
+Deep sleep is a full reboot, so these three values are kept in RTC memory and
+redrawn immediately on wake: the link icons from the last successful online
+operation and the battery fill from the reading taken just before the gauge was
+put to sleep. The fill is then replaced by the first valid post-wake reading
+(the UI retries every 2 s until the gauge finishes its first conversion). A
+power cycle or reflash clears RTC memory, so the header starts from "unknown"
+there. The gauge is trusted only when the measured cell voltage is plausible
+(at least 2500 mV), so a sleeping or just-restarted chip that answers `0x00` is
+not painted as `0%`.
+
+## Profile and digital buddy
+
+`CREATE PROFILE` generates a random profile identity and pairs it with a digital
+buddy. The screen cycles through eight preset names with UP/DOWN; OK creates a
+UUIDv4-style 36-character id and a buddy of a random species, stores both, and
+opens the BUDDY screen. With an existing profile the screen only reports the id,
+because it names the sync folder and replacing it silently would orphan the
+remote copy; `RESET PROGRESS` removes the profile and its buddy.
+
+The buddy has four species (`BLOB`, `KIT`, `PIPLING`, `DRAKE`) and four forms.
+It starts at form 1 and evolves when XP reaches 300, 900, and 2000, for three
+evolutions total. Each evolution unlocks a skill:
+
+| Form | Skill | Effect |
+| --- | --- | --- |
+| 1 | none | — |
+| 2 | `FOCUS` | +10% XP per correct answer |
+| 3 | `ECHO` | repeats a missed word aloud |
+| 4 | `INSIGHT` | +20% XP (stacking with `FOCUS`) |
+
+A correct answer awards `10 x English level` XP, so words from higher levels
+(1–10 in `SETTINGS`) are worth more. A happy buddy (energy at least 60) adds
+25% on top. Correct answers restore 2 energy; wrong answers cost 2, and each
+completed session costs 5. A session with at least 70% accuracy earns one snack
+(up to 999). Feeding consumes one snack, restores 25 energy, and is done with
+OK on the BUDDY screen; HOLD OK returns to the menu.
+
+`BUDDY` draws the 24x24 palette-index sprite at 2x in a canvas, then shows the
+name and species, current form, XP toward the next evolution, energy, snacks,
+and the active skill. Answers, evolutions, and snacks for the current session
+are summarized on the session-complete screen. Buddy state is saved after every
+answer, so a power loss loses at most the current card.
+
+The profile id names a virtual folder in Azure Blob Storage. `SYNC NOW` writes
+`profiles/<profile id>/progress.lsprog` in the container configured on the Phone
+Setup page; see [Progress sync](#progress-sync).
 
 ## Data formats
 
@@ -140,14 +187,20 @@ reordering lessons or editing a word's text does not lose history.
 ## Persistence
 
 - NVS namespace: `langstudy`.
-- Keys: `wifi_ssid`, `wifi_pass`, `api_key`, `sync_url`, `exam`, `level`,
-  `bright`, `volume`, `word_delay`, `avoid_hist`.
+- Keys: `wifi_ssid`, `wifi_pass`, `api_key`, `sync_url` (Azure container SAS
+  URL), `exam`, `level`, `bright`, `volume`, `word_delay`, `avoid_hist`,
+  `prof_id`, `buddy`.
 - Pack storage uses two slots. A new pack is written to the inactive slot,
   committed, and then the index flips, so a power loss leaves the previous pack
   authoritative. A corrupt slot is skipped on boot.
 - If both slots fail, the device falls back to the built-in 100-word pack
   (`langstudy_builtin.c`).
 - Progress is written after every answer and after each completed session.
+- The buddy record follows the same line-plus-CRC convention:
+  `BUDDY|1|<species>|<name>|<form>|<energy>|<snacks>|<xp>|<revision>` then
+  `END|<CRC32>`. It is written after every answer and every feed. A corrupt
+  record is ignored; if the profile id survives, a fresh buddy is generated so
+  the menu is never stuck.
 
 ## Scheduling
 
@@ -226,7 +279,10 @@ The `PHONE SETUP` menu item starts a SoftAP:
    page address `http://192.168.4.1`.
 2. The phone joins the AP and opens the page.
 3. The page collects Wi-Fi SSID/password, the DeepSeek API key, and an optional
-   sync URL.
+   HTTPS container SAS URL for Azure Blob Storage. The SAS field accepts up to
+   512 characters and is write-only, like the API key: leaving it blank keeps
+   the saved URL, and a checkbox deletes it. The URL is a credential and is
+   never logged or shown back.
 4. The device verifies the station connection before writing anything to NVS.
    A failed test reports the reason and stores nothing.
 5. When Wi-Fi was configured, the device immediately runs the connection check
@@ -355,30 +411,71 @@ separately instead of a single opaque error:
 A failed refresh now maps `ESP_ERR_HTTP_CONNECT` to `Cannot reach DeepSeek
 (Wi-Fi/TLS)` and the serial log carries the `errno` and heap watermark.
 
-## Optional progress sync
+## Progress sync
 
-Sync is disabled unless `sync_url` is set. It is started from the `PROGRESS`
-screen: `SYNC NOW` runs the sync when the URL is configured, and shows
-`SYNC NOW (SETUP)` otherwise. The device POSTs its `LSPROG` snapshot as
-`text/plain` and receives a merged snapshot. The local snapshot remains
-authoritative:
+Sync is disabled unless all three are present: a Wi-Fi network, a container SAS
+URL saved on the Phone Setup page, and a profile created with `CREATE PROFILE`.
+It is started from the `PROGRESS` screen; otherwise the row reads
+`SYNC NOW (SETUP)` and the status page names what is missing.
 
-- a word record wins when its `revision` is higher; ties keep the local copy;
-- new word IDs are appended while the table has room;
-- `session_count` and the counters follow the side with more completed
-  sessions.
+### Azure layout
 
-`tools/langstudy_sync_server.py` implements this contract with the standard
-library only:
+The configured URL is a container SAS URL such as
+`https://ACCOUNT.blob.core.windows.net/CONTAINER?sv=...&sig=...`. Blob Storage
+has no real folders: the device writes a blob whose name looks like a path, so
+the portal shows a `profiles/<profile id>/` folder:
 
-```sh
-python3 tools/langstudy_sync_server.py --port 8080 --store tools/var/sync-store
+```text
+CONTAINER/
+  profiles/
+    12345678-abcd-4f01-9ead-beef0badf00d/
+      progress.lsprog
 ```
 
-Each URL path keeps an independent snapshot, so
-`http://<host>:8080/devices/alice` and `.../devices/bob` do not share history.
-The server stores files under `tools/var/`, which is git-ignored. `GET /health`
-returns `ok`; `GET <path>` returns the stored snapshot or 404.
+`progress.lsprog` is the same `LSPROG` text document used locally
+(`text/plain`). The container must already exist; the SAS needs read, create,
+and write permission (`sp` includes `r`, `c`, and `w`) and should be HTTPS-only
+(`spr=https`). Generate it in the portal under **Container → Shared access
+token**, or with:
+
+```sh
+az storage container create --account-name ACCOUNT --name CONTAINER
+SAS=$(az storage container generate-sas --account-name ACCOUNT \
+  --name CONTAINER --permissions rcw --https-only \
+  --expiry 2027-01-01 -o tsv)
+echo "https://ACCOUNT.blob.core.windows.net/CONTAINER?$SAS"
+```
+
+Paste the echoed URL into Phone Setup. Re-generating the token yields a full
+URL that replaces the saved one.
+
+The URL is a bearer credential. It is stored in NVS like the API key, never
+printed by the firmware, and never included in a status screen or log line;
+failures report `HTTP 403` (expired or wrong SAS), `HTTP 404` (container
+missing), or the transport error instead.
+
+### Merge order
+
+A sync is read-merge-write, not a server-side merge:
+
+1. `GET profiles/<id>/progress.lsprog` with `x-ms-version` and `x-ms-date`
+   (SNTP runs first because Azure rejects stale dates and TLS needs a clock).
+2. A `404` means the first sync for this profile; the merged document is the
+   local snapshot. Any other non-200 status stops the sync with the status code.
+3. Merge the remote document into a copy of the local snapshot. The local side
+   stays authoritative: a word record wins when its `revision` is higher, ties
+   keep the local copy, new word IDs are appended while the table has room, and
+   `session_count`/counters follow the side with more completed sessions.
+4. `PUT` the merged document back as a `BlockBlob` with
+   `x-ms-blob-type: BlockBlob`. Azure returns `201` when the blob is created and
+   `200` when it is overwritten.
+5. The UI merges the returned snapshot into live state (idempotent) and saves it.
+
+One 20 KiB document buffer is reused for the GET response and the PUT body so
+the sync does not need two large allocations while TLS is active. A single
+device is assumed per profile; there is no ETag/`If-Match` loop. If two devices
+sync the same profile at the same moment, the later write wins but the next sync
+merges the other device's records by revision.
 
 ## Power management
 
@@ -399,8 +496,9 @@ returns `ok`; `GET <path>` returns the stored snapshot or 404.
 ```
 
 The static checks include `tests/test_langstudy_logic.c` (pack/progress,
-scheduling, phonemes, synthesis, JSON, generation extraction, setup forms) and
-`tests/test_langstudy_sync_server.py`.
+scheduling, phonemes, synthesis, JSON, generation extraction, setup forms),
+`tests/test_langstudy_buddy.c`, and `tests/test_langstudy_azure.c` (SAS URL
+validation, blob path building, and the `x-ms-date` spelling).
 
 `tools/langstudy_demo_pack.txt` is a finalized copy of the built-in pack. It is
 useful for inspecting the wire format or for feeding a known-good pack to
@@ -422,7 +520,9 @@ tooling without a device.
    separately, and `DeepSeek: OK` appears with a valid API key. After a
    successful check the Wi-Fi and `D` icons appear at the right of the study
    screen header; the same line shows `PASSPORT ENGLISH` and the vertical
-   battery bar (an empty outline when the gauge has no reading).
+   battery bar (an empty outline when the gauge has never reported a value).
+   Both icons and the last battery fill survive deep sleep; they are redrawn
+   on wake before any online operation runs.
 7. On a study card the order is word, IPA, then Chinese translation: the
    translation wraps to two lines without overlapping the part of speech.
 8. The pronunciation line renders IPA (for example `/həˈloʊ/`), not raw
@@ -465,23 +565,36 @@ tooling without a device.
     stops it; HOLD OK stops it and opens the menu. The loop must not leave the
     current lesson and must not change the session score.
 13. Choose `PROGRESS`: the screen shows sessions, answered cards, accuracy,
-    studied words, and completion. With a sync URL configured, `SYNC NOW` makes
-    the server log a POST and the device reports the merged result; without
-    one the row reads `SYNC NOW (SETUP)`.
+    studied words, and completion. With Wi-Fi, a SAS URL, and a profile
+    configured, `SYNC NOW` creates
+    `profiles/<profile id>/progress.lsprog` in the container and reports
+    `Progress synced`; a second sync overwrites the same blob. Without them the
+    row reads `SYNC NOW (SETUP)`.
 14. Complete two sessions in a row and confirm the second set of cards does not
     repeat the first when the pack has enough words.
 15. Leave the device idle: the screen dims at 30 seconds and the device sleeps
     at 5 minutes; a button press wakes it.
-16. Choose `RESET PROGRESS`: all learning records and the recent-generation
-    avoid history are cleared and a fresh session starts; the active word pack
-    is kept.
+16. Choose `RESET PROGRESS`: all learning records, the recent-generation avoid
+    history, the profile, and its buddy are cleared and a fresh session starts;
+    the active word pack is kept.
+17. Choose `CREATE PROFILE`: UP/DOWN cycles the preset names, OK shows the
+    BUDDY screen with a sprite, form, XP, energy, and snacks. Answer cards and
+    confirm the buddy gains XP (more at a higher English level, and 25% more
+    while energy is at least 60). Feed with OK when a snack is held; HOLD OK
+    returns to the menu. Power-cycle and confirm the same profile id, name,
+    species, and XP return. A session with at least 70% accuracy adds a snack.
 
 ## Known limitations
 
 - DeepSeek output is probabilistic; the pack validator is the only guarantee of
   content quality, not of pedagogy.
-- Progress sync has no authentication or device identity. Put the server behind
-  a trusted network or a reverse proxy if it is exposed.
+- Progress sync relies on a container SAS. The token is the only credential:
+  scope it to one container, keep it HTTPS-only, set a finite expiry, and rotate
+  it (re-save on Phone Setup) before it expires. The firmware keeps only the URL
+  in NVS, so a factory reset or `RESET PROGRESS` does not revoke the SAS.
+- The buddy record is device-local; only `progress.lsprog` is uploaded. A second
+  device with the same profile id shares learning history but starts with its
+  own buddy.
 - The formant synthesizer is clearer than earlier versions but still synthetic;
   it is only the offline fallback, not a replacement for the neural voice.
 - Online pronunciation depends on an undocumented Microsoft endpoint. The

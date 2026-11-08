@@ -17,7 +17,10 @@
 #define LS_SSID_MAX 32
 #define LS_WIFI_PASS_MAX 63
 #define LS_API_KEY_MAX 200
-#define LS_SYNC_URL_MAX 160
+// Container SAS URL for Azure Blob Storage. Long enough for a portal-generated
+// token with an edited expiry; the URL carries a credential, so it is never
+// logged or echoed in an error message.
+#define LS_SYNC_URL_MAX 512
 
 // User-facing preferences. Brightness and volume move in LS_LEVEL_STEP steps.
 #define LS_BRIGHTNESS_DEFAULT 80

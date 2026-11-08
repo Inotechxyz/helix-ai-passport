@@ -21,6 +21,11 @@ void ls_progress_init(ls_progress_t *progress);
 ls_status_t ls_progress_parse(const char *text, size_t len, ls_progress_t *out);
 ls_status_t ls_progress_write(const ls_progress_t *progress,
                               char *out, size_t cap, size_t *out_len);
+// Exact byte count ls_progress_write() would produce. Lets the sync path size
+// its upload buffer instead of reserving LS_PROGRESS_TEXT_MAX while the TLS
+// session is live.
+ls_status_t ls_progress_write_size(const ls_progress_t *progress,
+                                   size_t *out_len);
 
 ls_progress_record_t *ls_progress_find(ls_progress_t *progress, uint32_t word_id);
 const ls_progress_record_t *ls_progress_find_const(const ls_progress_t *progress,

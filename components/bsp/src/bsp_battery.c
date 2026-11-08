@@ -23,6 +23,10 @@ static const char *TAG = "bsp_batt";
 #define CW_UPDATE_FLAG    0x80
 #define CW_PROFILE_SIZE   80
 
+// 刚被 RESTART 唤醒的 CW2017 在完成首次转换前,SOC 和 VCELL 都回 0x00。
+// 锂电芯不可能读到 0 mV,所以用电压而不是百分比区分"0% 且快没电"和"还没就绪"。
+#define CW_VCELL_MIN_MV   2500
+
 // Wanli New Energy 500 mAh, profile2 / XIL40X / 2026-10-20.
 // Exact vendor bytes: assets/battery/wanli-500mah-profile2-xil40x-20261020.txt.
 // Infer the array length so the assertion also catches missing initializer bytes.
@@ -115,12 +119,21 @@ static int cw_update_profile(void) {
     return cw_enter_active();
 }
 
-// 首次计算期间 SOC 可能暂时大于 100；最多等待 5 秒再判定初始化失败。
+static bool reading_is_plausible(int soc, int mv) {
+    return soc >= 0 && soc <= 100 && mv >= CW_VCELL_MIN_MV;
+}
+
+// 首次计算期间 SOC 可能暂时大于 100,也可能与 VCELL 一起读到 0x00;
+// 两者都视为"未就绪"。最多等 2 秒,失败后保留设备句柄交给 UI 继续重试,
+// 避免把开机时间拖在背光点亮之前。
 static int cw_wait_soc_ready(void) {
-    for (int retry = 0; retry < 50; retry++) {
+    for (int retry = 0; retry < 20; retry++) {
         uint8_t soc = 0;
         vTaskDelay(pdMS_TO_TICKS(100));
-        if (cw_read(CW_REG_SOC_H, &soc, 1) == 0 && soc <= 100) return 0;
+        if (cw_read(CW_REG_SOC_H, &soc, 1) == 0 &&
+            reading_is_plausible(soc, bsp_battery_mv())) {
+            return 0;
+        }
     }
     return -1;
 }
@@ -177,9 +190,10 @@ esp_err_t bsp_battery_init(void) {
     }
 
     if (cw_wait_soc_ready() != 0) {
-        ESP_LOGE(TAG, "等待首次 SOC 计算超时");
-        e = ESP_ERR_TIMEOUT;
-        goto fail;
+        // 芯片已应答但还没算完。保留句柄:UI 每秒级重试,一次有效读数就能
+        // 点亮表头;若这里拆掉设备,本机就再也不会显示电量。
+        ESP_LOGW(TAG, "首次 SOC 计算超时;保留句柄等待后续读数");
+        return ESP_ERR_TIMEOUT;
     }
 
     ESP_LOGI(TAG, "CW2017 ready: SOC=%d%%, voltage=%d mV",
@@ -222,6 +236,8 @@ int bsp_battery_soc(void) {
     if (cw_read(CW_REG_SOC_H, b, 2) != 0) return -1;
     int soc = b[0];                       // 高字节即整数百分比
     if (soc > 100) return -1;             // 芯片未就绪时可能读到 0xFF
+    int mv = bsp_battery_mv();
+    if (mv < 0 || mv < CW_VCELL_MIN_MV) return -1;  // 休眠/重启中或无电芯
     return soc;
 }
 

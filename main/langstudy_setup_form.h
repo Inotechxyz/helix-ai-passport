@@ -16,4 +16,5 @@ bool ls_form_get(const char *body, size_t len, const char *key,
 bool ls_setup_validate_ssid(const char *ssid);
 bool ls_setup_validate_password(const char *password);
 bool ls_setup_validate_api_key(const char *key);   // empty clears the key
-bool ls_setup_validate_server_url(const char *url); // empty disables sync
+// Empty disables sync; otherwise an HTTPS container SAS URL with a signature.
+bool ls_setup_validate_server_url(const char *url);

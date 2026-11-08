@@ -20,6 +20,7 @@ static const uint8_t previous_profile[80] = {
 static uint8_t registers[256], config_writes[8];
 static unsigned adds, removes, reads, writes, profile_writes, verified_reads;
 static unsigned flag_writes, config_count, delay_ms, soc_polls;
+static unsigned ready_after_polls;
 static int fail_read_reg, fail_write_reg, corrupt_read_reg;
 static unsigned fail_reads, fail_writes;
 static bool missing_device, fail_bus, fail_add;
@@ -39,6 +40,7 @@ static void reset_device(bool matched, bool flag)
     registers[CW_REG_VCELL_H] = 0x32; // 12800 * 312.5 uV = 4000 mV.
     adds = removes = reads = writes = profile_writes = verified_reads = 0;
     flag_writes = config_count = delay_ms = soc_polls = 0;
+    ready_after_polls = 0;
     fail_read_reg = fail_write_reg = corrupt_read_reg = -1;
     fail_reads = fail_writes = 0;
     missing_device = fail_bus = fail_add = false;
@@ -104,6 +106,12 @@ esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t device,
     assert(read_length > 0 && (size_t)reg + read_length <= sizeof(registers));
     ++reads;
     if (reg == CW_REG_SOC_H && read_length == 1) ++soc_polls;
+    // Simulate a gauge that finishes its first conversion on this poll.
+    if (reg == CW_REG_SOC_H && read_length == 1 && ready_after_polls &&
+        soc_polls >= ready_after_polls) {
+        registers[CW_REG_SOC_H] = 62;
+        registers[CW_REG_VCELL_H] = 0x32;
+    }
     if ((missing_device && reg == CW_REG_VERSION) ||
         (reg == fail_read_reg && fail_reads)) {
         if (fail_reads) --fail_reads;
@@ -233,7 +241,9 @@ static void test_soc_and_voltage(void)
     reset_device(true, true);
     registers[CW_REG_SOC_H] = 101;
     assert(bsp_battery_init() == ESP_ERR_TIMEOUT);
-    assert(soc_polls == 50 && delay_ms == 5000 && removes == 1 && !s_dev);
+    // The handle survives a timeout: the gauge may still be computing, and the
+    // UI polls again instead of losing the header for the rest of the boot.
+    assert(soc_polls == 20 && delay_ms == 2000 && removes == 0 && s_dev != NULL);
     registers[CW_REG_SOC_H] = 100;
     assert(bsp_battery_init() == ESP_OK);
     assert(bsp_battery_soc() == 100);
@@ -262,7 +272,31 @@ static void test_soc_and_voltage(void)
     fail_read_reg = CW_REG_SOC_H;
     fail_reads = 50;
     assert(bsp_battery_init() == ESP_ERR_TIMEOUT);
-    assert(soc_polls == 50 && delay_ms == 5000 && removes == 1 && !s_dev);
+    assert(soc_polls == 20 && delay_ms == 2000 && removes == 0 && s_dev != NULL);
+}
+
+static void test_waits_for_a_plausible_reading(void)
+{
+    // A CW2017 that was just restarted out of sleep mode answers 0x00 to both
+    // SOC and VCELL. The old readiness test accepted 0 and the header painted
+    // an empty bar after every wake; 0 mV is what distinguishes "not ready"
+    // from a genuinely empty but real pack.
+    reset_device(true, true);
+    registers[CW_REG_SOC_H] = 0;
+    registers[CW_REG_VCELL_H] = 0;
+    ready_after_polls = 3;
+    assert(bsp_battery_init() == ESP_OK);
+    assert(soc_polls == 3 && delay_ms == 300);
+    assert(bsp_battery_soc() == 62 && bsp_battery_mv() == 4000);
+
+    reset_device(true, true);
+    assert(bsp_battery_init() == ESP_OK);
+    registers[CW_REG_VCELL_H] = 0;
+    assert(bsp_battery_soc() == -1);   // sleeping/restarting gauge
+    registers[CW_REG_VCELL_H] = 0x32;
+    assert(bsp_battery_soc() == 62);
+    registers[CW_REG_SOC_H] = 0;
+    assert(bsp_battery_soc() == 0);    // empty pack with a real voltage is valid
 }
 
 int main(void)
@@ -271,6 +305,7 @@ int main(void)
     test_profile_failures();
     test_missing_and_recovery();
     test_soc_and_voltage();
+    test_waits_for_a_plausible_reading();
     puts("CW2017 battery: profile migration/readback, match, faults, retry, SOC/voltage PASS");
     return 0;
 }

@@ -42,6 +42,16 @@ static volatile uint32_t s_request_seq;
 static bool s_net_owned;
 static TickType_t s_net_last_use;
 
+// The word currently being fetched or spoken. The Edge round trip is slow
+// enough (a couple of seconds before the first sound) that learners tap UP
+// again while the first request is still in flight; cancelling it there is
+// what made the first attempt sound cut off.
+static volatile bool s_active;
+static char s_active_text[LS_WORD_TEXT_MAX + 1];
+// Set when a repeat tap is absorbed while the same word is active. If that
+// active attempt then fails, the worker replays it from its own copy.
+static volatile bool s_repeat_requested;
+
 bool ls_voice_cancelled(void)
 {
     return s_cancel;
@@ -108,24 +118,48 @@ static void voice_task(void *arg)
             continue;
         }
 
-        s_cancel = false;
-        bool spoken = false;
-        if (voice_net_ready()) {
-            s_net_last_use = xTaskGetTickCount();
-            // Connecting can take seconds; a newer tap may have replaced this
-            // job while we waited. Do not speak the stale word on top of it.
-            if (job.seq == s_request_seq) {
-                spoken = ls_edge_tts_play(job.text, ls_voice_cancelled);
-            } else {
-                s_cancel = true;
+        for (;;) {
+            s_cancel = false;
+            s_repeat_requested = false;
+            // Publish the active word before doing anything observable, so a
+            // repeat tap on the same word is absorbed instead of cancelling
+            // this attempt midway.
+            strncpy(s_active_text, job.text, LS_WORD_TEXT_MAX);
+            s_active_text[LS_WORD_TEXT_MAX] = '\0';
+            s_active = true;
+
+            bool spoken = false;
+            if (voice_net_ready()) {
+                s_net_last_use = xTaskGetTickCount();
+                // Connecting can take seconds; a newer tap may have replaced
+                // this job while we waited. Do not speak the stale word on top
+                // of it.
+                if (job.seq == s_request_seq) {
+                    spoken = ls_edge_tts_play(job.text, ls_voice_cancelled);
+                } else {
+                    s_cancel = true;
+                }
+                s_net_last_use = xTaskGetTickCount();
             }
-            s_net_last_use = xTaskGetTickCount();
-        }
-        if (!spoken && !s_cancel && job.pron[0] != '\0') {
-            // The offline path also covers a caller that got here with no
-            // network at all. Words without a stored pronunciation have
-            // nothing to synthesize offline; the online voice uses the text.
-            (void)ls_audio_speak(job.pron);
+            s_active = false;
+            if (!spoken && !s_cancel && job.pron[0] != '\0') {
+                // The offline path also covers a caller that got here with no
+                // network at all. Words without a stored pronunciation have
+                // nothing to synthesize offline; the online voice uses the
+                // text.
+                (void)ls_audio_speak(job.pron);
+            }
+
+            // A repeat tap was absorbed while this attempt ran. Replay only if
+            // the attempt produced nothing: the learner tapped again because
+            // they did not hear the word, not because they wanted it twice.
+            if (!spoken && !s_cancel && s_repeat_requested) {
+                s_repeat_requested = false;
+                ESP_LOGI(TAG, "重试一次在线发音");
+                continue;
+            }
+            s_repeat_requested = false;
+            break;
         }
     }
 }
@@ -146,6 +180,17 @@ esp_err_t ls_voice_init(void)
     }
     s_cancel = false;
     return ESP_OK;
+}
+
+void ls_voice_stop(void)
+{
+    // Invalidate the in-flight job: the worker compares job.seq before it
+    // starts, and the cancel flag aborts a request that is already running.
+    s_cancel = true;
+    s_request_seq++;
+    s_repeat_requested = false;
+    if (s_queue) xQueueReset(s_queue);
+    ls_audio_stop();
 }
 
 void ls_voice_shutdown(void)
@@ -173,6 +218,15 @@ bool ls_voice_speak(const char *text, const char *pron)
     // there is nothing to try, so go straight to the offline voice.
     if (!s_queue || !ls_config_has_wifi(&ls_state()->config)) {
         return ls_audio_speak(pron);
+    }
+
+    // A repeat tap on the word that is already being fetched or spoken must
+    // not cut it off: the online round trip often takes longer than the learner
+    // expects, and cancelling here produced a half-spoken first attempt. The
+    // worker replays it only if the attempt ends up producing no sound.
+    if (s_active && strcmp(text, s_active_text) == 0) {
+        s_repeat_requested = true;
+        return true;
     }
 
     voice_job_t job;
