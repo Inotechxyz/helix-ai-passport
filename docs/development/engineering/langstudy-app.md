@@ -392,17 +392,25 @@ well over a minute; the longer timeout keeps that wait from being reported as a
 failure. `sdkconfig.defaults` enables mbedTLS dynamic record buffers (so the
 RX/TX record buffers are freed after each record instead of being held for the
 whole session), keeps the RX record at 8 KB because a larger certificate flight
-can arrive in one record, and trims the Wi-Fi static RX buffers: a static 8 KB
-RX buffer held for the whole session fragmented the post-handshake heap enough
-that the pack allocation failed even with tens of kilobytes reported free. The
-dynamic Wi-Fi RX/TX pools are also capped at 8 buffers each (stock is 32): while
-an SSE reply streams, the live set is the 16.9 KiB pack buffer, the dynamic TLS
-record buffer, and one Wi-Fi buffer per in-flight frame, and the AES-DMA driver
-needs its own DMA-capable allocations to decrypt each record. With the stock
-caps a CET6 refresh failed mid-stream with `ESP_FAIL` after arbitrary content
-bytes (5677 and 2242 observed); the log showed `esp-aes: Failed to allocate
-memory` followed by `esp-tls-mbedtls: read error :-0x7180`, i.e. the heap was
-too squeezed for the decrypt path even though the read error surfaced with
+can arrive in one record, and trims the Wi-Fi static RX pool to 4 buffers
+(stock is 10). Static RX buffers are allocated at `esp_wifi_init` and never
+freed, so they are permanently unavailable to TLS, the AES-DMA staging path,
+and the pack buffer. On the ESP32-C3 unit with 8 static buffers, an IELTS
+refresh reached the response body with only 6,272 B free / 2,048 B largest and
+4,068 B DMA free / 1,152 B largest: the AES-DMA path could not allocate its
+1,600-byte staging buffer, and another attempt could not allocate the
+16,896-byte pack buffer from a 14,336-byte largest block. Four static buffers
+returned 6,400 B to that pool; four consecutive IELTS refreshes then opened TLS
+with roughly 57-58 KB free / 30,720 B largest, allocated the pack buffer every
+time, and streamed with an 8-9 KiB largest DMA-capable block still available. The dynamic
+Wi-Fi RX/TX pools are also capped at 8 buffers each (stock is 32): while an SSE
+reply streams, the live set is the 16.9 KiB pack buffer, the dynamic TLS record
+buffer, and one Wi-Fi buffer per in-flight frame, and the AES-DMA driver needs
+its own DMA-capable allocations to decrypt each record. With the stock caps a
+CET6 refresh failed mid-stream with `ESP_FAIL` after arbitrary content bytes
+(5677 and 2242 observed); the log showed `esp-aes: Failed to allocate memory`
+followed by `esp-tls-mbedtls: read error :-0x7180`, i.e. the heap was too
+squeezed for the decrypt path even though the read error surfaced with
 `errno=0`. A
 60-word pack also keeps the streamed text within the SRAM available on the
 ESP32-C3. The refresh path performs no content-sized allocation after TLS: once

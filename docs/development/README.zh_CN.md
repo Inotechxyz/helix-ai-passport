@@ -30,6 +30,7 @@
 - [lvgl-chinese-fonts.zh_CN.md](engineering/lvgl-chinese-fonts.zh_CN.md)：CJK 配置、字体生成/链接、fallback 示例、缺字检查和故障排查的分步指南。
 - [wifi-provisioning.zh_CN.md](engineering/wifi-provisioning.zh_CN.md)：参考 BLUFI 分支实现蓝牙 Wi-Fi 配网，包含配套小程序名称及接入检查。
 - [langstudy-app.zh_CN.md](engineering/langstudy-app.zh_CN.md)：离线优先英语学习应用，包含词包/进度格式、排程、发音、配网、联网生成、可选同步与真机验收。
+- [langstudy-lessons.zh_CN.md](engineering/langstudy-lessons.zh_CN.md)：同一应用的可迁移工程经验，包含 SRAM/TLS 预算、生成内容校验、持久化、小屏 UX 与真机调试。
 
 ## CI（ci）
 

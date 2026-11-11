@@ -21,6 +21,7 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 - [lvgl-chinese-fonts.md](engineering/lvgl-chinese-fonts.md): step-by-step CJK configuration, font generation/linking, fallback examples, glyph checks, and troubleshooting.
 - [wifi-provisioning.md](engineering/wifi-provisioning.md): Bluetooth-based Wi-Fi setup using the BLUFI reference branch, the companion mini program, and integration checks.
 - [langstudy-app.md](engineering/langstudy-app.md): offline-first English study application — pack/progress formats, scheduling, pronunciation, provisioning, online generation, optional sync, and device acceptance.
+- [langstudy-lessons.md](engineering/langstudy-lessons.md): transferable engineering lessons from the same app — SRAM/TLS budgeting, generated-content validation, persistence, tiny-UI UX, and hardware debugging.
 
 ## CI
 

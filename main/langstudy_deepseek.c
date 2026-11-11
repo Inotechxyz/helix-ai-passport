@@ -222,6 +222,14 @@ esp_err_t ls_deepseek_generate(const ls_deepseek_cfg_t *cfg,
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
+    // Record the post-handshake headroom on the success path too: the next
+    // streaming failure needs the numbers from before the first read, not only
+    // the leftovers after the heap has been squeezed.
+    ESP_LOGI(TAG, "词包缓冲已分配(%u 字节), 剩余堆=%u, 最大连续=%u, DMA最大=%u 字节",
+             (unsigned)PACK_STREAM_MAX,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
     // DeepSeek streams OpenAI-compatible Server-Sent Events while it generates:
     // each line is "data: {...}" and carries a small delta.content fragment.

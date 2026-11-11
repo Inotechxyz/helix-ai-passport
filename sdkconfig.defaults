@@ -57,20 +57,34 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 # --- Wi-Fi buffers ---
 # The application holds one station connection and streams small HTTP/SSE
 # responses; it does not need the stock 10 static RX buffers (~16 KiB reserved
-# at init). Trimming them leaves more contiguous internal RAM for TLS and the
-# generated-pack buffer. Dynamic buffers are allocated on demand, so capping
-# them limits the peak without reserving RAM at idle.
+# at init). Static buffers are allocated at esp_wifi_init and never freed, so
+# every one of them is permanently unavailable to TLS, the AES-DMA staging
+# path, and the generated-pack buffer. Four static buffers still cover a
+# 5760-byte TCP receive window (about four 1440-byte frames) while the dynamic
+# pool absorbs bursts. Dynamic buffers are allocated on demand, so capping them
+# limits the peak without reserving RAM at idle.
+#
+# Measured on the ESP32-C3 unit with 8 static + 8 dynamic: an IELTS refresh
+# reached the response body with only 6,272 B free / 2,048 B largest and 4,068 B
+# DMA free / 1,152 B largest, so the AES-DMA decrypt path could not allocate
+# its 1600-byte staging buffer (esp-aes: Failed to allocate memory, then
+# TLS error 29056 = MBEDTLS_ERR_SSL_INVALID_MAC). On another attempt the
+# post-handshake largest block was 14,336 B, below the 16,896-byte pack buffer.
+# Dropping four static buffers returns 6,400 B to exactly the pool both paths
+# need, and lowers the live Wi-Fi RX ceiling from 25.6 KiB to 19.2 KiB.
+# With 4 static buffers, four consecutive IELTS refreshes on the same unit
+# opened TLS with roughly 57-58 KB free / 30,720 B largest, allocated the pack
+# buffer every time, and streamed with an 8-9 KiB largest DMA-capable block
+# still available (previously 1,152 B).
 #
 # The dynamic caps are deliberately below the stock 32. While an SSE reply is
 # streaming, the live set is the 16.9 KiB pack buffer, the dynamic TLS record
-# buffer, and one Wi-Fi RX buffer per in-flight frame (1600 B each). With a
-# 5760-byte TCP receive window only a handful of data frames can be in flight
-# at once, so 8+8 dynamic buffers are ample. Larger caps were observed to
-# starve the AES-DMA path mid-read: the decrypt path could not allocate a
-# DMA-capable buffer, mbedTLS reported a read error, and the whole refresh
-# failed with ESP_FAIL after an arbitrary number of content bytes, even though
-# a later free-heap reading looked healthy.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+# buffer, and one Wi-Fi RX buffer per in-flight frame (1600 B each). Larger
+# caps were observed to starve the AES-DMA path mid-read: the decrypt path
+# could not allocate a DMA-capable buffer, mbedTLS reported a read error, and
+# the whole refresh failed with ESP_FAIL after an arbitrary number of content
+# bytes, even though a later free-heap reading looked healthy.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 
