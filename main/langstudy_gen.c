@@ -45,7 +45,8 @@ static unsigned count_words(const char *list)
 // prose preamble, a markdown fence, or 50-odd WORD lines when the format is
 // only described loosely; every deviation costs a full 60-word retry on this
 // device. The size of this text is bounded by PROMPT_CAP in
-// langstudy_deepseek.c: base text + worst-case avoid list must stay below it.
+// langstudy_deepseek.c: base text + seed line + theme/style hints + worst-case
+// avoid list must stay below LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX.
 static const char s_prompt_format[] =
     "Create a %s English vocabulary pack for Chinese learners.\n"
     "Return exactly one JSON object with one key, \"pack\", and nothing else. "
@@ -132,6 +133,83 @@ static const char *level_description(uint8_t level)
     }
 }
 
+// Topic hints break the model out of its favourite sample. Without them the
+// seed is only a hex string the model can ignore, and consecutive refreshes
+// keep returning campus/science/travel words. The table is deliberately broad
+// and every entry is a single short noun phrase so six of them fit in one
+// prompt line. Themes only steer the domain; level_description() still bounds
+// frequency, and the prompt repeats that instruction.
+static const char *const s_lesson_themes[] = {
+    "astronomy", "cooking", "law", "insects", "banking", "film",
+    "geology", "fashion", "medicine", "music", "navigation", "psychology",
+    "sports", "weather", "agriculture", "crafts", "urban life", "games",
+    "transport", "mythology", "architecture", "biology", "chemistry",
+    "physics", "economics", "politics", "history", "geography", "literature",
+    "theater", "dance", "photography", "engineering", "sailing", "camping",
+    "fishing", "gardening", "animals", "plants", "food", "clothing",
+    "furniture", "tools", "machines", "electricity", "computing", "military",
+    "diplomacy",
+};
+
+// Register/word-shape hints. Every entry must stay a single-word category:
+// the avoid history stores space-separated tokens and skips entries that
+// contain a space, so asking for phrasal verbs or idioms would create words
+// the exclusion list can never match.
+static const char *const s_word_styles[] = {
+    "colloquial words",
+    "formal or academic words",
+    "sensory adjectives",
+    "workplace and technology words",
+    "words with Greek or Latin roots",
+    "emotion and personality words",
+    "nature and weather words",
+    "money and business words",
+    "movement and sports verbs",
+    "art and music words",
+    "everyday household words",
+    "words about cities and buildings",
+};
+
+#define LS_SEED_POOL_MAX 64
+#define LS_THEME_COUNT (sizeof(s_lesson_themes) / sizeof(s_lesson_themes[0]))
+#define LS_STYLE_COUNT (sizeof(s_word_styles) / sizeof(s_word_styles[0]))
+#define LS_THEME_PICK 6
+#define LS_STYLE_PICK 2
+_Static_assert(LS_THEME_COUNT <= LS_SEED_POOL_MAX, "theme table too large");
+_Static_assert(LS_STYLE_COUNT <= LS_SEED_POOL_MAX, "style table too large");
+
+// xorshift32 step. Seed 0 would stay 0 forever and always pick the first
+// entries, so it is replaced by a fixed non-zero value; the result is still
+// deterministic for a given seed, which the host tests rely on.
+static uint32_t seed_next(uint32_t *state)
+{
+    uint32_t x = *state;
+    if (x == 0) x = 0x6D2B79F5u;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+// Partial Fisher-Yates over a small stack pool: returns `count` distinct
+// indexes in 0..total-1. The pool is 64 bytes; no heap is touched.
+static void seed_pick(uint32_t seed, uint8_t count, uint8_t total,
+                      uint8_t *out)
+{
+    uint8_t pool[LS_SEED_POOL_MAX];
+    uint32_t state = seed;
+    for (uint8_t i = 0; i < total; i++) pool[i] = i;
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t span = (uint8_t)(total - i);
+        uint8_t j = (uint8_t)(i + (uint8_t)(seed_next(&state) % span));
+        uint8_t tmp = pool[i];
+        pool[i] = pool[j];
+        pool[j] = tmp;
+        out[i] = pool[i];
+    }
+}
+
 bool ls_gen_build_prompt_ex(char *out, size_t cap, size_t *out_len,
                             ls_exam_t exam, const char *avoid_words,
                             bool strict_avoid, uint32_t seed,
@@ -150,14 +228,43 @@ bool ls_gen_build_prompt_ex(char *out, size_t cap, size_t *out_len,
     // same "random" sample. The level starts at the user's SETTINGS choice and
     // is nudged upward by accumulated sessions and answers; neither value is
     // trusted for correctness (the device still dedupes and enforces the avoid
-    // list).
+    // list). The seed also deterministically selects the theme and style hints
+    // below, so it steers the sample instead of being a string the model can
+    // ignore.
     n = snprintf(out + used, cap - used,
                  "- Pack seed: %08lX (learner level %u of 10; 1 = starter, "
-                 "10 = professional). Treat it as a random "
-                 "topics/letters/frequency selector so this list differs from "
-                 "every earlier one; prefer %s.\n",
+                 "10 = professional). Use it to vary word choice within that "
+                 "level; prefer %s.\n",
                  (unsigned long)seed, (unsigned)level,
                  level_description(level));
+    if (n < 0 || (size_t)n >= cap - used) return false;
+    used += (size_t)n;
+
+    // Six themes for six lessons and two style categories per pack. The salt
+    // decorrelates the two draws, so a seed that picks similar themes does not
+    // also pick the same styles. Both draws are deterministic and allocation
+    // free; the hints are advisory, while the validator remains the contract.
+    uint8_t themes[LS_THEME_PICK];
+    uint8_t styles[LS_STYLE_PICK];
+    seed_pick(seed, LS_THEME_PICK, (uint8_t)LS_THEME_COUNT, themes);
+    seed_pick(seed ^ 0xA5A5A5A5u, LS_STYLE_PICK, (uint8_t)LS_STYLE_COUNT,
+              styles);
+
+    n = snprintf(out + used, cap - used,
+                 "- Lesson themes chosen by the seed: %s, %s, %s, %s, %s, "
+                 "%s. Give each lesson one theme, in order; keep every word "
+                 "within the requested level.\n",
+                 s_lesson_themes[themes[0]], s_lesson_themes[themes[1]],
+                 s_lesson_themes[themes[2]], s_lesson_themes[themes[3]],
+                 s_lesson_themes[themes[4]], s_lesson_themes[themes[5]]);
+    if (n < 0 || (size_t)n >= cap - used) return false;
+    used += (size_t)n;
+
+    n = snprintf(out + used, cap - used,
+                 "- Across the pack, mix in a few words of each style: %s; "
+                 "%s. Stay within the requested level and use single words "
+                 "only.\n",
+                 s_word_styles[styles[0]], s_word_styles[styles[1]]);
     if (n < 0 || (size_t)n >= cap - used) return false;
     used += (size_t)n;
 
@@ -234,7 +341,7 @@ static void writer_puts(json_writer_t *w, const char *text)
 #define REQ_USER_PREFIX "\"},{\"role\":\"user\",\"content\":\""
 #define REQ_SUFFIX \
     "\"}],\"response_format\":{\"type\":\"json_object\"}," \
-    "\"temperature\":0.5,\"max_tokens\":8192,\"stream\":true}"
+    "\"temperature\":1.0,\"top_p\":1.0,\"max_tokens\":8192,\"stream\":true}"
 
 // One escape table feeds both the fixed-size writer and the streaming sink.
 typedef void (*escape_put_t)(void *ctx, const char *data, size_t len);
@@ -300,8 +407,11 @@ bool ls_gen_build_request(char *out, size_t cap, const char *model,
     escape_emit(prompt, writer_escape_put, &w);
     // Streaming keeps bytes flowing while the model generates, so one slow
     // generation cannot trip a blocking read timeout the way stream=false can.
-    // Lower temperature keeps the long, rigid line format stable; variety
-    // comes from the explicit avoid list rather than sampling.
+    // Temperature 1.0 (the API default) widens the sample beyond the old 0.5
+    // on top of the seed-selected theme and style hints. JSON mode, the
+    // explicit 60-line contract, the sanitizer and one automatic retry are
+    // what keep the malformed-output risk bounded; top_p stays at its neutral
+    // default so only one knob is raised.
     writer_puts(&w, REQ_SUFFIX);
     if (!w.ok) return false;
     out[w.used] = '\0';

@@ -36,6 +36,7 @@ idf_component_register(
          "langstudy_voice.c"
          "langstudy_ws_frame.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp lvgl esp_event esp_hw_support esp_netif esp_timer esp_wifi
-             nvs_flash esp_http_client esp_http_server esp-tls mbedtls minimp3
+    REQUIRES bsp lvgl esp_event esp_app_format esp_hw_support esp_netif
+             esp_timer esp_wifi nvs_flash esp_http_client esp_http_server esp-tls
+             mbedtls minimp3
 )

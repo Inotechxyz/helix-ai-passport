@@ -133,18 +133,26 @@ because it names the sync folder and replacing it silently would orphan the
 remote copy; `RESET PROGRESS` removes the profile and its buddy.
 
 The buddy has four species (`BLOB`, `KIT`, `PIPLING`, `DRAKE`) and four forms.
-It starts at form 1 and evolves when lifetime XP reaches 2000, 8000, and 20000,
-for three evolutions total. At the default level that is roughly 3, 11, and 26
-sessions of 20 cards. Evolution is monotonic: an already evolved buddy keeps
-its form even when the thresholds change in a later firmware, so raising them
-never demotes an existing buddy. Each form unlocks a skill:
+It starts at form 1 and evolves when lifetime XP reaches 6000, 24000, and 60000,
+for three evolutions total. At the default level (4), a happy buddy that answers
+every card correctly earns about 50–55 XP per card, so an evolution takes
+roughly 6, 22, and 55 sessions of 20 cards; lower levels, inaccurate answers,
+or an unhappy buddy stretch each step. Evolution is monotonic: an already
+evolved buddy keeps its form even when the thresholds change in a later
+firmware, so raising them never demotes an existing buddy. Each form unlocks a
+skill:
 
 | Form | Skill | Effect |
 | --- | --- | --- |
 | 1 | none | — |
 | 2 | `FOCUS` | +10% XP per correct answer |
-| 3 | `ECHO` | repeats a missed word aloud |
+| 3 | `ECHO` | reads each newly shown card aloud |
 | 4 | `INSIGHT` | +20% XP (stacking with `FOCUS`) |
+
+`ECHO` deliberately reads the card that becomes current after an answer, not the
+one just answered: the old replay spoke the previous word after the next card
+was already on screen, so it sounded like the wrong word started by itself on
+DOWN or OK. UP still replays the current word on demand.
 
 A correct answer awards `10 x English level` XP, so words from higher levels
 (1–10 in `SETTINGS`) are worth more. A happy buddy (energy at least 60) adds
@@ -152,6 +160,20 @@ A correct answer awards `10 x English level` XP, so words from higher levels
 completed session costs 5. A session with at least 70% accuracy earns one snack
 (up to 999). Feeding consumes one snack, restores 25 energy, and is done with
 OK on the BUDDY screen; HOLD OK returns to the menu.
+
+Inactivity costs XP, but never a form. The first three idle days are free;
+each additional full day removes 1% of the buddy's remaining XP, so the loss
+shrinks as the balance shrinks and it can never go negative. The stage comes
+from a persistent `stage` field instead of being re-derived from XP, so an
+evolved buddy keeps its skill even after weeks away — it just has to earn the
+next form from a lower balance. Answers record the current wall-clock time as
+the idle reference; decay is settled lazily when the BUDDY screen opens or the
+next answer is graded. The ESP32-C3 has no battery-backed RTC, so a fresh boot
+has no valid clock until SNTP runs during a network operation; times before
+2020-09 are ignored and no decay is charged until the clock is plausible. A
+record written by older firmware (no idle reference) starts its grace window on
+the first settlement rather than back-dating it. When decay happens, the BUDDY
+screen shows `IDLE: -<n> XP`.
 
 `BUDDY` draws the 24x24 palette-index sprite at 2x in a canvas, then shows the
 name and species, current form, XP toward the next evolution, energy, snacks,
@@ -230,10 +252,11 @@ reordering lessons or editing a word's text does not lose history.
   (`langstudy_builtin.c`).
 - Progress is written after every answer and after each completed session.
 - The buddy record follows the same line-plus-CRC convention:
-  `BUDDY|1|<species>|<name>|<form>|<energy>|<snacks>|<xp>|<revision>` then
-  `END|<CRC32>`. It is written after every answer and every feed. A corrupt
-  record is ignored; if the profile id survives, a fresh buddy is generated so
-  the menu is never stuck.
+  `BUDDY|2|<species>|<name>|<form>|<energy>|<snacks>|<xp>|<idle_epoch>|<revision>`
+  then `END|<CRC32>`. Version 1 records (no `idle_epoch`) are still parsed and
+  load with a zero reference. It is written after every answer, every feed, and
+  every decay settlement. A corrupt record is ignored; if the profile id
+  survives, a fresh buddy is generated so the menu is never stuck.
 
 ## Scheduling
 
@@ -338,13 +361,25 @@ When the user chooses `REFRESH WORDS` and a network plus API key are available:
    first) plus a rolling history of words from earlier generated packs, and
    forbids reusing them, including plural and tense forms. Every request carries
    a fresh random seed and an English level from 1 (starter) to 10
-   (professional). The level starts at the value chosen in `SETTINGS` and rises
-   with the session count plus answered cards, so repeated refreshes vary the
-   topic mix, starting letters and word frequency. After a malformed reply the
-   retry mixes the attempt number into the seed and adds the strict warning, so
-   the second sample is not just the first one again.
+   (professional). The seed deterministically selects six lesson themes from a
+   built-in table of 48 domains (astronomy, cooking, law, insects, banking,
+   film, …) and two style/register categories from a second table (colloquial,
+   formal or academic, sensory adjectives, …). The prompt asks for one theme per
+   lesson and a few words of each style, always at the requested level, so
+   repeated refreshes explore different domains and registers instead of the
+   model's favourite campus/science/travel sample. Style hints stay single-word
+   categories because the avoid history is space-separated; phrasal verbs and
+   idioms would escape exclusion. The level starts at the value chosen in
+   `SETTINGS` and rises with the session count plus answered cards, so word
+   frequency still tracks progress. After a malformed reply the retry mixes the
+   attempt number into the seed and adds the strict warning, so the second
+   sample is not just the first one again.
 2. The request goes to `https://api.deepseek.com/chat/completions` with model
-   `deepseek-chat` and `response_format` set to a JSON object.
+   `deepseek-chat` and `response_format` set to a JSON object. It sends
+   `temperature` 1.0 and `top_p` 1.0 to widen the sample beyond the old 0.5;
+   JSON mode, the explicit line contract, the sanitizer and the single retry
+   contain the higher risk of a malformed or short reply. (`top_k` is not in
+   the DeepSeek API schema and is not sent.)
 3. The response is extracted and validated before it replaces the active pack.
    A short reply is not discarded: if the model stopped early or appended prose,
    `ls_gen_sanitize_pack()` drops the partial tail and model-supplied `END`,
@@ -612,7 +647,9 @@ tooling without a device.
    least 30 complete words is trimmed and accepted; a malformed reply is retried once
    with a stricter prompt. If the accepted reply reused words from the avoid
    list it is still applied: the status reads `SOME WORDS REPEATED` and
-   `DOWN: DETAIL` lists them. The success message reports the accepted count
+   `DOWN: DETAIL` lists them. Consecutive refreshes should show different lesson
+   themes/titles and a different style mix, and malformed-reply retries should
+   stay occasional. The success message reports the accepted count
    (normally `60 new words ready`). A failure status offers `DOWN: DETAIL`
    with the worker's diagnostic text.
    Once every word in the active pack has been studied (the `COMPLETION` row
@@ -626,6 +663,9 @@ tooling without a device.
     `ENGLISH LEVEL` runs from 1 (starter) to 10 (professional), defaults to 4,
     and is the starting point for word retrieval; progress raises the effective
     level above it. `WORD DELAY` is the auto-play dwell in seconds (default 5).
+    The header shows the firmware version (`v<semver>` from `version.txt`) and
+    the footer shows the build timestamp, both read from the app descriptor, so
+    a device report can be matched to the exact image.
 12. On a study card, HOLD DOWN to start auto-play for the current lesson: the
     progress line reads `AUTO n / m` and the thin bar drains over the dwell
     time before the card advances. HOLD DOWN again (or press any other key)
@@ -653,11 +693,20 @@ tooling without a device.
     while energy is at least 60). Feed with OK when a snack is held; HOLD OK
     returns to the menu. Power-cycle and confirm the same profile id, name,
     species, and XP return. A session with at least 70% accuracy adds a snack.
+18. With a plausibly synced clock, advance the device time past the three-day
+    grace (or restore a buddy record with an older `idle_epoch`) and open
+    BUDDY: the header reads `IDLE: -<n> XP`, XP drops by 1% per extra idle day,
+    and the form and skill are unchanged. Reopening BUDDY immediately after
+    charges nothing further.
 
 ## Known limitations
 
 - DeepSeek output is probabilistic; the pack validator is the only guarantee of
-  content quality, not of pedagogy.
+  content quality, not of pedagogy. `temperature` 1.0 (the DeepSeek default) is
+  still above the old 0.5 and raises the chance of a malformed, short, or
+  duplicate-heavy reply, so the automatic retry may run more often.
+- Theme hints only steer the domain; they cannot guarantee that every word stays
+  inside the requested frequency band, especially at levels 1–3.
 - Progress sync relies on a container SAS. The token is the only credential:
   scope it to one container, keep it HTTPS-only, set a finite expiry, and rotate
   it (re-save on Phone Setup) before it expires. The firmware keeps only the URL
@@ -665,6 +714,9 @@ tooling without a device.
 - The buddy record is device-local; only `progress.lsprog` is uploaded. A second
   device with the same profile id shares learning history but starts with its
   own buddy.
+- Inactivity decay needs a plausible wall clock. A device kept permanently
+  offline (or powered off before any SNTP sync) never decays; this is the
+  deliberate trade-off for not having a battery-backed RTC.
 - The formant synthesizer is clearer than earlier versions but still synthetic;
   it is only the offline fallback, not a replacement for the neural voice.
 - Online pronunciation depends on an undocumented Microsoft endpoint. The

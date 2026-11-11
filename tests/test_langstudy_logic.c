@@ -633,6 +633,18 @@ static void test_json_and_gen(void)
     CHECK(ls_gen_build_prompt(full_prompt, sizeof(full_prompt), &full_len,
                               LS_EXAM_CET4, big_avoid, true));
     CHECK(full_len < sizeof(full_prompt));
+    // The seed-selected hint lines vary in length, so one draw is not enough.
+    // Sweep many seeds and every level against the longest exam text and the
+    // full avoid list; this is the regression guard for the prompt budget.
+    for (uint32_t seed = 0; seed < 512; seed++) {
+        for (uint8_t level = 1; level <= 10; level++) {
+            size_t swept_len = 0;
+            CHECK(ls_gen_build_prompt_ex(full_prompt, sizeof(full_prompt),
+                                         &swept_len, LS_EXAM_CET4, big_avoid,
+                                         true, seed, level));
+            CHECK(swept_len < sizeof(full_prompt));
+        }
+    }
     // The retry after a repeated-word rejection carries an explicit warning.
     CHECK(strstr(full_prompt, "STRICT") != NULL);
     CHECK(strstr(prompt, "STRICT") == NULL);
@@ -655,6 +667,12 @@ static void test_json_and_gen(void)
     // The HTTPS worker consumes SSE so a slow 60-word generation does not
     // trip the per-read socket timeout.
     CHECK(strstr(request, "\"stream\":true") != NULL);
+    // Wide sampling replaces the old format-stability temperature. top_k is
+    // not part of the DeepSeek API schema and must not appear.
+    CHECK(strstr(request, "\"temperature\":1.0") != NULL);
+    CHECK(strstr(request, "\"top_p\":1.0") != NULL);
+    CHECK(strstr(request, "\"temperature\":0.5") == NULL);
+    CHECK(strstr(request, "top_k") == NULL);
 
     // The streamed body must equal the fixed-size body, and the Content-Length
     // helper must match it exactly; otherwise the header and the bytes written
@@ -1101,8 +1119,64 @@ static void test_synth(void)
     CHECK(!ls_tts_start(&invalid, "", 1));
 }
 
+// Copy the hint list between `prefix` and the sentence-ending period so two
+// prompts can be compared without the differing seed line or the instruction
+// sentence that follows the list.
+static void copy_hint(const char *prompt, const char *prefix, char *out,
+                      size_t cap)
+{
+    out[0] = '\0';
+    const char *p = strstr(prompt, prefix);
+    if (!p) return;
+    p += strlen(prefix);
+    const char *end = strchr(p, '.');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len >= cap) len = cap - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
+
+// Number of entries in a hint joined by ", " (themes) or "; " (styles).
+static int hint_token_count(const char *hint, const char *separator)
+{
+    int count = 0;
+    const char *p = hint;
+    while (*p) {
+        const char *end = strstr(p, separator);
+        if (end ? end > p : *p) count++;
+        if (!end) break;
+        p = end + strlen(separator);
+    }
+    return count;
+}
+
+// True when the comma-separated hint contains a repeated entry.
+static bool hint_has_duplicate(const char *hint, const char *separator)
+{
+    const char *a = hint;
+    while (*a) {
+        const char *a_end = strstr(a, separator);
+        size_t a_len = a_end ? (size_t)(a_end - a) : strlen(a);
+        const char *b = a_end ? a_end + strlen(separator) : NULL;
+        while (b && *b) {
+            const char *b_end = strstr(b, separator);
+            size_t b_len = b_end ? (size_t)(b_end - b) : strlen(b);
+            if (a_len == b_len && strncmp(a, b, a_len) == 0) return true;
+            if (!b_end) break;
+            b = b_end + strlen(separator);
+        }
+        if (!a_end) break;
+        a = a_end + strlen(separator);
+    }
+    return false;
+}
+
 static void test_gen_seed_and_history(void)
 {
+    static const char kThemePrefix[] = "- Lesson themes chosen by the seed: ";
+    static const char kStylePrefix[] =
+        "- Across the pack, mix in a few words of each style: ";
+
     // A fresh seed and the learner level must reach the prompt verbatim: they
     // are what stops REFRESH from converging on the same "random" sample.
     char prompt[LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX];
@@ -1113,6 +1187,63 @@ static void test_gen_seed_and_history(void)
     CHECK(strstr(prompt, "A1B2C3D4") != NULL);
     CHECK(strstr(prompt, "learner level 7 of 10") != NULL);
     CHECK(strstr(prompt, "IELTS band 6-7") != NULL);
+    // The seed no longer asks the model to invent a topic mix from hex; it
+    // deterministically selects six lesson themes and two style categories.
+    CHECK(strstr(prompt, kThemePrefix) != NULL);
+    CHECK(strstr(prompt, kStylePrefix) != NULL);
+    CHECK(strstr(prompt, "use single words only") != NULL);
+    CHECK(strstr(prompt, "topics/letters/frequency") == NULL);
+    CHECK(strstr(prompt, "Use it to vary word choice within that level") != NULL);
+
+    char hint_a[256];
+    char style_a[256];
+    copy_hint(prompt, kThemePrefix, hint_a, sizeof(hint_a));
+    copy_hint(prompt, kStylePrefix, style_a, sizeof(style_a));
+    CHECK(hint_a[0] != '\0');
+    CHECK(style_a[0] != '\0');
+    CHECK(hint_token_count(hint_a, ", ") == 6);
+    CHECK(hint_token_count(style_a, "; ") == 2);
+    CHECK(!hint_has_duplicate(hint_a, ", "));
+    CHECK(!hint_has_duplicate(style_a, "; "));
+
+    // Same seed, same hints; a different seed must change at least one of the
+    // two draws. This keeps the host test deterministic without pinning the
+    // exact table contents.
+    char repeat[LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX];
+    size_t repeat_len = 0;
+    CHECK(ls_gen_build_prompt_ex(repeat, sizeof(repeat), &repeat_len,
+                                 LS_EXAM_IELTS, NULL, false, 0xA1B2C3D4u, 7));
+    char hint_b[256];
+    char style_b[256];
+    copy_hint(repeat, kThemePrefix, hint_b, sizeof(hint_b));
+    copy_hint(repeat, kStylePrefix, style_b, sizeof(style_b));
+    CHECK(strcmp(hint_a, hint_b) == 0);
+    CHECK(strcmp(style_a, style_b) == 0);
+
+    char other[LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX];
+    size_t other_len = 0;
+    CHECK(ls_gen_build_prompt_ex(other, sizeof(other), &other_len,
+                                 LS_EXAM_IELTS, NULL, false, 0xA1B2C3D5u, 7));
+    char hint_c[256];
+    char style_c[256];
+    copy_hint(other, kThemePrefix, hint_c, sizeof(hint_c));
+    copy_hint(other, kStylePrefix, style_c, sizeof(style_c));
+    CHECK(strcmp(hint_a, hint_c) != 0 || strcmp(style_a, style_c) != 0);
+
+    // Seed 0 is what the legacy wrapper passes; the xorshift zero guard must
+    // still produce six distinct themes and two distinct styles.
+    char zero[LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX];
+    size_t zero_len = 0;
+    CHECK(ls_gen_build_prompt_ex(zero, sizeof(zero), &zero_len, LS_EXAM_CET4,
+                                 NULL, false, 0, 1));
+    char hint_zero[256];
+    char style_zero[256];
+    copy_hint(zero, kThemePrefix, hint_zero, sizeof(hint_zero));
+    copy_hint(zero, kStylePrefix, style_zero, sizeof(style_zero));
+    CHECK(hint_token_count(hint_zero, ", ") == 6);
+    CHECK(!hint_has_duplicate(hint_zero, ", "));
+    CHECK(hint_token_count(style_zero, "; ") == 2);
+    CHECK(!hint_has_duplicate(style_zero, "; "));
 
     // The SETTINGS level is the starting point; sessions and answered cards
     // raise it, clamped to 1..10. Out-of-range input is clamped because callers

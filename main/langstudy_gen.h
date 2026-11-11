@@ -6,10 +6,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// Space reserved for the fixed prompt body. The avoid list (up to
-// LS_AVOID_WORDS_MAX bytes) is appended after it, so callers size their buffer
-// as LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX.
-#define LS_GEN_PROMPT_BASE_MAX 2944
+// Space reserved for the fixed prompt body: format text, seed line, and the
+// two seed-selected hint lines (six lesson themes, two style categories). The
+// avoid list (up to LS_AVOID_WORDS_MAX bytes) is appended after it, so callers
+// size their buffer as LS_GEN_PROMPT_BASE_MAX + LS_AVOID_WORDS_MAX. The
+// measured worst case with a full avoid list and the STRICT retry line is
+// 4734 bytes; the host tests build that case across seeds and levels.
+#define LS_GEN_PROMPT_BASE_MAX 3264
 
 // English prompt describing the LSPACK line format for the chosen vocabulary
 // tier. The model is asked to omit END; the device appends a correct CRC for
@@ -23,10 +26,11 @@ bool ls_gen_build_prompt(char *out, size_t cap, size_t *out_len,
                          ls_exam_t exam, const char *avoid_words,
                          bool strict_avoid);
 
-// Same prompt plus two extra selection hints. `seed` is mixed into the request
-// as a fresh value on every generation, so the model cannot settle on the same
-// "random" sample each time; `level` (1..10) is the requested vocabulary level,
-// where 1 is starter and 10 is professional.
+// Same prompt plus deterministic selection hints. `seed` is a fresh random
+// value on every generation: it selects six lesson themes and two style
+// categories from fixed tables, so consecutive refreshes target different
+// domains and registers. `level` (1..10) is the requested vocabulary level,
+// where 1 is starter and 10 is professional; the hints repeat that bound.
 bool ls_gen_build_prompt_ex(char *out, size_t cap, size_t *out_len,
                             ls_exam_t exam, const char *avoid_words,
                             bool strict_avoid, uint32_t seed,

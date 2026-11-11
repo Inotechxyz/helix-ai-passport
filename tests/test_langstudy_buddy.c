@@ -3,6 +3,8 @@
 // evolution thresholds, feeding, and the BUDDY wire format.
 #include "langstudy_buddy.h"
 
+#include "langstudy_content.h"   // ls_crc32, for the version 1 record
+
 #include <stdio.h>
 #include <string.h>
 
@@ -74,6 +76,7 @@ static void test_names_and_stages(void)
     CHECK(buddy.energy == 80);
     CHECK(buddy.snacks == 2);
     CHECK(buddy.xp == 0);
+    CHECK(buddy.idle_epoch == 0);
     CHECK(buddy.revision == 1);
     CHECK(ls_buddy_is_happy(&buddy));
 
@@ -202,13 +205,14 @@ static void test_wire_format(void)
     buddy.energy = 55;
     buddy.snacks = 7;
     buddy.xp = 1234;
+    buddy.idle_epoch = 1700000000u;
     buddy.revision = 9;
 
     char text[LS_BUDDY_TEXT_MAX];
     size_t len = 0;
     CHECK(ls_buddy_write(&buddy, text, sizeof(text), &len) == LS_BUDDY_OK);
     CHECK(len > 0 && len < sizeof(text));
-    CHECK(strncmp(text, "BUDDY|1|3|5|2|55|7|1234|9\n", 25) == 0);
+    CHECK(strncmp(text, "BUDDY|2|3|5|2|55|7|1234|1700000000|9\n", 37) == 0);
     CHECK(strstr(text, "END|") != NULL);
     CHECK(text[len - 1] == '\n');
 
@@ -221,7 +225,33 @@ static void test_wire_format(void)
     CHECK(parsed.energy == buddy.energy);
     CHECK(parsed.snacks == buddy.snacks);
     CHECK(parsed.xp == buddy.xp);
+    CHECK(parsed.idle_epoch == buddy.idle_epoch);
     CHECK(parsed.revision == buddy.revision);
+
+    // A version 1 record (written before decay existed) still loads; the
+    // missing idle reference is reconstructed on the first settlement.
+    char v1line[64];
+    int v1line_len = snprintf(v1line, sizeof(v1line),
+                              "BUDDY|1|3|5|2|55|7|1234|9\n");
+    char v1[LS_BUDDY_TEXT_MAX];
+    int v1_len = snprintf(v1, sizeof(v1), "%sEND|%08lX\n", v1line,
+                          (unsigned long)ls_crc32(v1line, (size_t)v1line_len));
+    CHECK(v1_len > 0 && (size_t)v1_len < sizeof(v1));
+    memset(&parsed, 0, sizeof(parsed));
+    CHECK(ls_buddy_parse(v1, (size_t)v1_len, &parsed) == LS_BUDDY_OK);
+    CHECK(parsed.xp == 1234);
+    CHECK(parsed.idle_epoch == 0);
+    CHECK(parsed.revision == 9);
+
+    // The field count must match the declared version.
+    char wrong_count[64];
+    int wc_len = snprintf(wrong_count, sizeof(wrong_count),
+                          "BUDDY|1|3|5|2|55|7|1234|9|10\n");
+    char wc[LS_BUDDY_TEXT_MAX];
+    int wc_total = snprintf(wc, sizeof(wc), "%sEND|%08lX\n", wrong_count,
+                            (unsigned long)ls_crc32(wrong_count, (size_t)wc_len));
+    CHECK(wc_total > 0 && (size_t)wc_total < sizeof(wc));
+    CHECK(ls_buddy_parse(wc, (size_t)wc_total, &parsed) == LS_BUDDY_ERR_FORMAT);
 
     // A changed CRC digit must be rejected.
     char corrupt[LS_BUDDY_TEXT_MAX];
@@ -241,6 +271,88 @@ static void test_wire_format(void)
     // A tight buffer reports ERR_SIZE instead of overflowing.
     buddy.snacks = 2;
     CHECK(ls_buddy_write(&buddy, text, 8, &len) == LS_BUDDY_ERR_SIZE);
+}
+
+static void test_decay(void)
+{
+    const uint32_t day = 86400u;
+    const uint32_t now = 1700000000u;
+    const uint32_t grace = LS_BUDDY_DECAY_GRACE_DAYS * day;
+    ls_buddy_t buddy;
+
+    // Inactivity inside the grace window costs nothing, and the reference is
+    // left alone so the free days are not restarted or consumed.
+    ls_buddy_init(&buddy, 0, 0);
+    buddy.xp = 10000;
+    buddy.stage = 3;
+    buddy.idle_epoch = now - 2 * day;
+    uint32_t rev = buddy.revision;
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 0);
+    CHECK(buddy.xp == 10000);
+    CHECK(buddy.idle_epoch == now - 2 * day);
+    CHECK(buddy.revision == rev);
+
+    // The grace boundary itself is still free.
+    buddy.idle_epoch = now - grace;
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 0);
+    CHECK(buddy.xp == 10000);
+
+    // One day past the grace: 1% of the remaining XP, and the evolved form
+    // survives even though XP now sits below the stage 3 threshold.
+    buddy.idle_epoch = now - grace - day;
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 100);
+    CHECK(buddy.xp == 9900);
+    CHECK(buddy.stage == 3);
+    CHECK(buddy.revision > rev);
+
+    // Settling again at the same instant charges nothing: the reference moved
+    // forward to "now - grace", so the same days cannot be deducted twice.
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 0);
+    CHECK(buddy.xp == 9900);
+
+    // Another two idle days: 2% of what is left.
+    CHECK(ls_buddy_apply_decay(&buddy, now + 2 * day) == 198);
+    CHECK(buddy.xp == 9702);
+
+    // The bonus stays tied to the persisted stage, not to the XP table.
+    bool evolved = false;
+    buddy.energy = 0;
+    CHECK(ls_buddy_award(&buddy, 5, true, &evolved) == 65);
+    CHECK(buddy.stage == 3);
+
+    // An unsynced clock is ignored completely: no loss, no reference change.
+    ls_buddy_init(&buddy, 0, 0);
+    buddy.xp = 10000;
+    buddy.idle_epoch = now - 30 * day;
+    CHECK(ls_buddy_apply_decay(&buddy, LS_BUDDY_EPOCH_MIN - 1) == 0);
+    CHECK(buddy.xp == 10000);
+    CHECK(buddy.idle_epoch == now - 30 * day);
+
+    // A record with no reference (v1 or first run) starts the window now.
+    buddy.idle_epoch = 0;
+    rev = buddy.revision;
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 0);
+    CHECK(buddy.idle_epoch == now);
+    CHECK(buddy.revision == rev + 1);
+
+    // A clock that jumped backwards never grows XP; it just re-anchors.
+    buddy.idle_epoch = now + 5 * day;
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 0);
+    CHECK(buddy.xp == 10000);
+    CHECK(buddy.idle_epoch == now);
+
+    // Empty XP has nothing to lose, and the reference still advances.
+    buddy.xp = 0;
+    buddy.idle_epoch = now - 10 * day;
+    CHECK(ls_buddy_apply_decay(&buddy, now) == 0);
+    CHECK(buddy.xp == 0);
+    CHECK(buddy.idle_epoch == now - grace);
+
+    // Study activity restarts the idle window; a stale clock never erases it.
+    ls_buddy_touch(&buddy, now);
+    CHECK(buddy.idle_epoch == now);
+    ls_buddy_touch(&buddy, 123u);
+    CHECK(buddy.idle_epoch == now);
 }
 
 static void test_merge(void)
@@ -270,6 +382,7 @@ int main(void)
     test_xp_rewards();
     test_session_and_feeding();
     test_wire_format();
+    test_decay();
     test_merge();
 
     if (s_failures) {

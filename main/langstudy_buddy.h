@@ -23,13 +23,21 @@
 #define LS_BUDDY_HAPPY_ENERGY 60
 
 // Lifetime XP needed to reach each stage. Stage 3 is the final form. At the
-// default level a happy buddy earns roughly 50 XP per correct answer, so these
-// are about 3, 11 and 26 sessions (20 cards each) - deliberately challenging.
-#define LS_BUDDY_XP_STAGE1 2000
-#define LS_BUDDY_XP_STAGE2 8000
-#define LS_BUDDY_XP_STAGE3 20000
+// default level a happy buddy earns roughly 55 XP per correct answer, so these
+// are about 6, 22 and 55 sessions (20 cards each) - deliberately challenging.
+#define LS_BUDDY_XP_STAGE1 6000
+#define LS_BUDDY_XP_STAGE2 24000
+#define LS_BUDDY_XP_STAGE3 60000
 
 #define LS_BUDDY_XP_PER_LEVEL 10
+
+// Inactivity decay. An evolved buddy never falls back a form, but its XP fades
+// while the learner is away: the first three idle days are free, then each
+// additional day removes 1% of the remaining XP. A caller must pass a real
+// wall-clock value; anything before 2020-09 is treated as unsynced and ignored.
+#define LS_BUDDY_DECAY_GRACE_DAYS 3
+#define LS_BUDDY_DECAY_PERMILLE_PER_DAY 10
+#define LS_BUDDY_EPOCH_MIN 1600000000u
 
 typedef struct {
     uint8_t species;    // 0..LS_BUDDY_SPECIES_COUNT-1
@@ -38,6 +46,9 @@ typedef struct {
     uint16_t energy;    // 0..LS_BUDDY_ENERGY_MAX
     uint16_t snacks;    // feed currency earned by good sessions
     uint32_t xp;        // lifetime experience
+    // Reference for inactivity decay: study sets it to now, a decay
+    // settlement leaves it at now - grace. 0 means "not known yet".
+    uint32_t idle_epoch;
     uint32_t revision;  // monotonic; higher wins when merging remote state
 } ls_buddy_t;
 
@@ -85,14 +96,29 @@ uint32_t ls_buddy_award(ls_buddy_t *buddy, uint8_t level, bool correct,
 void ls_buddy_finish_session(ls_buddy_t *buddy, uint16_t correct, uint16_t total,
                              bool *snack_earned, bool *evolved);
 
+// Record study activity at `now_epoch` (Unix seconds) and restart the idle
+// window. Values before LS_BUDDY_EPOCH_MIN are ignored, so an unsynced clock
+// never erases the previous reference.
+void ls_buddy_touch(ls_buddy_t *buddy, uint32_t now_epoch);
+
+// Apply inactivity decay. `now_epoch` must be a real wall-clock value; values
+// below LS_BUDDY_EPOCH_MIN are ignored. The first LS_BUDDY_DECAY_GRACE_DAYS
+// idle days are free; every additional full day removes
+// LS_BUDDY_DECAY_PERMILLE_PER_DAY of the remaining XP. The stage is never
+// changed, so an evolved buddy keeps its form. Returns the XP removed and
+// moves the idle reference forward, so charging the same days twice is not
+// possible. `idle_epoch` is maintained by ls_buddy_touch() and this function.
+uint32_t ls_buddy_apply_decay(ls_buddy_t *buddy, uint32_t now_epoch);
+
 // Spend one snack for condition. Feeding is refused when the buddy is full or
 // has nothing to eat.
 ls_buddy_feed_t ls_buddy_feed(ls_buddy_t *buddy);
 
 // ---------------------------------------------------------------------------
 // Wire format
-// BUDDY|1|<species>|<name>|<stage>|<energy>|<snacks>|<xp>|<revision>
+// BUDDY|2|<species>|<name>|<stage>|<energy>|<snacks>|<xp>|<idle_epoch>|<revision>
 // END|<crc32>
+// Version 1 records (no idle_epoch) are still accepted; they get idle_epoch = 0.
 // ---------------------------------------------------------------------------
 
 typedef enum {

@@ -22,6 +22,7 @@
 #include "langstudy_store.h"
 #include "langstudy_voice.h"
 
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -30,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Generated 16 px subset covering GB2312 plus ASCII. Words come from the model
 // at runtime, so a built-in LVGL CJK font is not enough; this table is the
@@ -782,6 +784,18 @@ static void show_settings(void)
     make_text_label(m, 10, 0, 220, 20, &lv_font_montserrat_14,
                     LS_UI_ACCENT, "SETTINGS");
 
+    // Firmware identity: the semantic version from version.txt and the link
+    // timestamp. The descriptor lives in flash, so reading it costs no heap
+    // and cannot fail; this is also what the boot log and OTA tooling report.
+    const esp_app_desc_t *app = esp_app_get_description();
+    lv_obj_t *ver = make_text_label(m, 160, 0, 70, 20, &lv_font_montserrat_14,
+                                    LS_UI_MUTED, "");
+    lv_obj_set_style_text_align(ver, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text_fmt(ver, "v%s", app->version);
+    lv_obj_t *build = make_text_label(m, 8, 240, 224, 24,
+                                      &lv_font_montserrat_14, LS_UI_MUTED, "");
+    lv_label_set_text_fmt(build, "BUILD %s %s", app->date, app->time);
+
     for (int i = 0; i < LS_SETTING_COUNT; i++) {
         lv_obj_t *row = lv_obj_create(m);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -1178,6 +1192,31 @@ static void buddy_bar(lv_obj_t *parent, int y, int permille, uint32_t color)
     lv_obj_set_style_bg_color(fill, lv_color_hex(color), 0);
 }
 
+// Settle inactivity decay whenever a real wall clock is available. The device
+// has no battery-backed RTC, so a fresh boot starts with an unsynced clock
+// until SNTP runs during a network operation; ls_buddy_apply_decay() ignores
+// anything before 2020-09 and the buddy simply waits for the next valid time.
+// Returns the XP removed and persists the buddy when its state moved.
+static uint32_t settle_buddy_decay(void)
+{
+    ls_state_t *state = ls_state();
+    if (!state->buddy_valid) return 0;
+
+    time_t now = time(NULL);
+    if (now < (time_t)LS_BUDDY_EPOCH_MIN) return 0;
+
+    uint32_t before = state->buddy.revision;
+    uint32_t lost = ls_buddy_apply_decay(&state->buddy, (uint32_t)now);
+    if (state->buddy.revision != before && state->storage_ready) {
+        (void)ls_store_save_buddy(&state->buddy);
+    }
+    if (lost > 0) {
+        ESP_LOGI(TAG, "buddy idle decay -%lu XP (now %lu)",
+                 (unsigned long)lost, (unsigned long)state->buddy.xp);
+    }
+    return lost;
+}
+
 static void show_buddy(const char *note)
 {
     ls_state_t *state = ls_state();
@@ -1197,6 +1236,8 @@ static void show_buddy(const char *note)
     }
 
     ls_buddy_t *buddy = &state->buddy;
+    // Settle decay before rendering so the number on screen is current.
+    uint32_t decayed = settle_buddy_decay();
     paint_buddy(m, buddy);
 
     char line[64];
@@ -1251,6 +1292,8 @@ static void show_buddy(const char *note)
 
     if (note && note[0]) {
         snprintf(line, sizeof(line), "%s", note);
+    } else if (decayed > 0) {
+        snprintf(line, sizeof(line), "IDLE: -%lu XP", (unsigned long)decayed);
     } else if (ls_buddy_is_happy(buddy)) {
         snprintf(line, sizeof(line), "HAPPY: +25%% XP");
     } else {
@@ -1360,11 +1403,17 @@ static void answer_card(bool correct)
 
     // The buddy earns XP from the same answer. Higher English levels are worth
     // more, and the per-answer energy drift keeps condition tied to activity.
+    // Idle decay is settled first, then the answer restarts the idle window.
     if (state->buddy_valid) {
+        (void)settle_buddy_decay();
         bool evolved = false;
         s_session_xp += ls_buddy_award(&state->buddy, state->config.level,
                                        correct, &evolved);
         if (evolved) s_session_evolved = true;
+        time_t now = time(NULL);
+        if (now >= (time_t)LS_BUDDY_EPOCH_MIN) {
+            ls_buddy_touch(&state->buddy, (uint32_t)now);
+        }
         if (state->storage_ready) {
             (void)ls_store_save_buddy(&state->buddy);
         }
@@ -1398,12 +1447,14 @@ static void answer_card(bool correct)
         maybe_auto_refresh();
     } else {
         update_study();
-    }
-
-    // ECHO (second evolution): repeat a missed word so the learner hears it
-    // again at the moment of the mistake.
-    if (!correct && state->buddy_valid && state->buddy.stage >= 2) {
-        (void)ls_voice_speak(word->text, word->pron);
+        // ECHO (stage 2): read the card the learner is now looking at. The old
+        // replay spoke the card they had just answered, after the next one was
+        // already on screen, so it sounded like the previous word started by
+        // itself on DOWN/OK.
+        if (state->buddy_valid && state->buddy.stage >= 2) {
+            const ls_word_t *next = current_word();
+            if (next) (void)ls_voice_speak(next->text, next->pron);
+        }
     }
 }
 

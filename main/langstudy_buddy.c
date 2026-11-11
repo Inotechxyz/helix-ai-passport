@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define LS_BUDDY_FORMAT_VERSION 1
+#define LS_BUDDY_FORMAT_VERSION 2
 #define LS_BUDDY_LINE_MAX 96
 
 static const char *const s_names[LS_BUDDY_NAME_COUNT] = {
@@ -19,7 +19,9 @@ static const char *const s_species[LS_BUDDY_SPECIES_COUNT] = {
 };
 
 // Stage 0 has no skill. Each evolution unlocks one; the descriptions are what
-// the BUDDY screen shows, and the effects live in ls_buddy_award().
+// the BUDDY screen shows, and the effects live in ls_buddy_award() and the UI.
+// ECHO reads the card that becomes current after an answer, so the audio always
+// matches what is on screen (it used to replay the card just left behind).
 static const char *const s_skills[LS_BUDDY_STAGE_COUNT] = {
     "-", "FOCUS", "ECHO", "INSIGHT",
 };
@@ -27,7 +29,7 @@ static const char *const s_skills[LS_BUDDY_STAGE_COUNT] = {
 static const char *const s_skill_detail[LS_BUDDY_STAGE_COUNT] = {
     "STUDY TO GROW",
     "+10% XP",
-    "SPEAKS AFTER A MISS",
+    "READS EACH NEW CARD",
     "+20% XP",
 };
 
@@ -223,11 +225,56 @@ ls_buddy_feed_t ls_buddy_feed(ls_buddy_t *buddy)
     return LS_BUDDY_FED;
 }
 
+void ls_buddy_touch(ls_buddy_t *buddy, uint32_t now_epoch)
+{
+    // An unsynced clock (1980 .. 2020-09) is useless for measuring idle days:
+    // ignore it instead of overwriting a good reference with a bogus one.
+    if (!buddy || now_epoch < LS_BUDDY_EPOCH_MIN) return;
+    buddy->idle_epoch = now_epoch;
+}
+
+uint32_t ls_buddy_apply_decay(ls_buddy_t *buddy, uint32_t now_epoch)
+{
+    if (!buddy || now_epoch < LS_BUDDY_EPOCH_MIN) return 0;
+
+    // No reference yet (v1 record or first run): start the grace window now
+    // rather than charging an unknown stretch of time.
+    if (buddy->idle_epoch == 0 || now_epoch <= buddy->idle_epoch) {
+        if (buddy->idle_epoch != now_epoch) {
+            buddy->idle_epoch = now_epoch;
+            buddy->revision++;
+        }
+        return 0;
+    }
+
+    const uint32_t grace = LS_BUDDY_DECAY_GRACE_DAYS * 86400u;
+    uint32_t idle = now_epoch - buddy->idle_epoch;
+    if (idle <= grace) return 0;
+
+    uint32_t days = (idle - grace) / 86400u;
+    if (days == 0) return 0;
+
+    uint64_t loss64 = (uint64_t)buddy->xp * LS_BUDDY_DECAY_PERMILLE_PER_DAY *
+                      days / 1000u;
+    uint32_t loss = loss64 > buddy->xp ? buddy->xp : (uint32_t)loss64;
+    if (loss > 0) buddy->xp -= loss;
+
+    // Leave the reference exactly `grace` behind now, so the days just charged
+    // are not charged again by the next settlement.
+    buddy->idle_epoch = now_epoch - grace;
+    // The stage is deliberately untouched: decay weakens the buddy but never
+    // demotes an evolved form.
+    buddy->revision++;
+    return loss;
+}
+
 // ---------------------------------------------------------------------------
 // Wire format
 // ---------------------------------------------------------------------------
 
-#define LS_BUDDY_FIELDS 9
+// Field count of the current format. Version 1 records have one field fewer
+// (no idle_epoch) and are accepted by the parser for backward compatibility.
+#define LS_BUDDY_FIELDS 10
 
 static size_t split_fields(const char *line, size_t len, const char **ptr,
                            size_t *flen, size_t max_fields)
@@ -301,7 +348,7 @@ ls_buddy_status_t ls_buddy_write(const ls_buddy_t *buddy, char *out,
 
     char line[LS_BUDDY_LINE_MAX];
     int written = snprintf(line, sizeof(line),
-                           "BUDDY|%u|%u|%u|%u|%u|%u|%lu|%lu\n",
+                           "BUDDY|%u|%u|%u|%u|%u|%u|%lu|%lu|%lu\n",
                            LS_BUDDY_FORMAT_VERSION,
                            (unsigned)buddy->species,
                            (unsigned)buddy->name_id,
@@ -309,6 +356,7 @@ ls_buddy_status_t ls_buddy_write(const ls_buddy_t *buddy, char *out,
                            (unsigned)buddy->energy,
                            (unsigned)buddy->snacks,
                            (unsigned long)buddy->xp,
+                           (unsigned long)buddy->idle_epoch,
                            (unsigned long)buddy->revision);
     if (written < 0 || (size_t)written >= sizeof(line)) return LS_BUDDY_ERR_SIZE;
 
@@ -338,17 +386,28 @@ ls_buddy_status_t ls_buddy_parse(const char *text, size_t len,
     size_t flen[LS_BUDDY_FIELDS];
     size_t count = split_fields(text, line_len, ptr, flen, LS_BUDDY_FIELDS);
     uint32_t version, species, name_id, stage, energy, snacks, xp, revision;
-    if (count != LS_BUDDY_FIELDS ||
-        !field_is(ptr[0], flen[0], "BUDDY") ||
-        !parse_u32(ptr[1], flen[1], 0xFFFFFFFFu, &version) ||
-        version != LS_BUDDY_FORMAT_VERSION ||
+    uint32_t idle_epoch = 0;
+    if (count < 2 || !field_is(ptr[0], flen[0], "BUDDY") ||
+        !parse_u32(ptr[1], flen[1], 0xFFFFFFFFu, &version)) {
+        return LS_BUDDY_ERR_FORMAT;
+    }
+    // v1 (nine fields) predates inactivity decay; the missing reference is
+    // reconstructed on the first decay settlement.
+    size_t expected = version == 1 ? 9 : LS_BUDDY_FIELDS;
+    if (version != 1 && version != LS_BUDDY_FORMAT_VERSION) {
+        return LS_BUDDY_ERR_FORMAT;
+    }
+    if (count != expected ||
         !parse_u32(ptr[2], flen[2], 255, &species) ||
         !parse_u32(ptr[3], flen[3], 255, &name_id) ||
         !parse_u32(ptr[4], flen[4], 255, &stage) ||
         !parse_u32(ptr[5], flen[5], 65535, &energy) ||
         !parse_u32(ptr[6], flen[6], 65535, &snacks) ||
         !parse_u32(ptr[7], flen[7], 0xFFFFFFFFu, &xp) ||
-        !parse_u32(ptr[8], flen[8], 0xFFFFFFFFu, &revision)) {
+        (version == LS_BUDDY_FORMAT_VERSION &&
+         !parse_u32(ptr[8], flen[8], 0xFFFFFFFFu, &idle_epoch)) ||
+        !parse_u32(ptr[expected - 1], flen[expected - 1], 0xFFFFFFFFu,
+                   &revision)) {
         return LS_BUDDY_ERR_FORMAT;
     }
     if (species >= LS_BUDDY_SPECIES_COUNT || name_id >= LS_BUDDY_NAME_COUNT ||
@@ -374,6 +433,7 @@ ls_buddy_status_t ls_buddy_parse(const char *text, size_t len,
     out->energy = (uint16_t)energy;
     out->snacks = (uint16_t)snacks;
     out->xp = xp;
+    out->idle_epoch = idle_epoch;
     out->revision = revision;
     return LS_BUDDY_OK;
 }
