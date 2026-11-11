@@ -11,12 +11,14 @@
 #include "esp_err.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef enum {
     LS_ONLINE_REFRESH = 0,   // generate a new 60-word pack via DeepSeek
     LS_ONLINE_SYNC,          // exchange progress with Azure Blob Storage
     LS_ONLINE_CHECK,         // report Wi-Fi and DeepSeek reachability
+    LS_ONLINE_PROBE,         // silently re-check both links after boot/wake
 } ls_online_op_t;
 
 typedef enum {
@@ -26,6 +28,7 @@ typedef enum {
     LS_ONLINE_SYNC_FAIL,
     LS_ONLINE_CHECK_OK,
     LS_ONLINE_CHECK_FAIL,
+    LS_ONLINE_PROBE_DONE,    // link flags only; the UI shows no screen
 } ls_online_msg_kind_t;
 
 #define LS_ONLINE_MESSAGE_MAX 160
@@ -45,7 +48,12 @@ typedef struct {
     ls_online_msg_kind_t kind;
     char message[LS_ONLINE_MESSAGE_MAX];
     char detail[LS_ONLINE_DETAIL_MAX]; // optional diagnostic explanation
-    ls_gen_pack_t *pack;      // REFRESH_OK: caller owns (staging model)
+    // REFRESH_OK: finalized pack text, caller owns. Handed over as text (not a
+    // parsed model) because a content-sized allocation after Wi-Fi/TLS is not
+    // reliable on the SRAM-only ESP32-C3; the UI parses it into its resident
+    // pack. May carry a trailing NUL but text_len is authoritative.
+    char *text;
+    size_t text_len;
     ls_progress_t *progress;  // SYNC_OK: remote snapshot, caller owns
     uint8_t link_flags;       // LS_LINK_* bit mask
 } ls_online_msg_t;
@@ -57,7 +65,12 @@ void ls_online_shutdown(void);
 // Returns false when busy or the worker is not running.
 bool ls_online_start(ls_online_op_t op);
 
-// Non-blocking. On true the caller owns msg->pack / msg->progress.
+// Non-blocking. On true the caller owns msg->text / msg->progress.
 bool ls_online_poll(ls_online_msg_t *msg);
 
 bool ls_online_busy(void);
+
+// True while the busy worker is only running LS_ONLINE_PROBE. The voice worker
+// uses this to wait for the boot check instead of falling back to the offline
+// voice; any other operation keeps the existing fallback.
+bool ls_online_probe_active(void);

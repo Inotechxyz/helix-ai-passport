@@ -181,6 +181,74 @@ static void test_content(void)
     CHECK(strcmp(parsed.words[5].pron, "B AE T") == 0);
     CHECK(strcmp(parsed.words[7].translation, "学习7") == 0);
 
+    // The allocation-free scan drives the online refresh path. On a valid pack
+    // it must accept, index the same fields the parser copies, and therefore
+    // guarantee that ls_pack_parse() cannot fail afterwards.
+    static ls_pack_slice_view_t scan;
+    static ls_pack_t rejected;
+    CHECK(ls_pack_scan_view(text, len, &scan) == LS_OK);
+    CHECK(scan.lesson_count == parsed.lesson_count);
+    CHECK(scan.word_count == parsed.word_count);
+    CHECK(scan.lessons[0].id == 1);
+    char slice_text[LS_TRANSLATION_MAX + 1];
+    CHECK(ls_pack_slice_copy(text, &scan.lessons[0].title, slice_text,
+                             sizeof(slice_text)));
+    CHECK(strcmp(slice_text, "Basics") == 0);
+    CHECK(ls_pack_slice_copy(text, &scan.words[7].text, slice_text,
+                             sizeof(slice_text)));
+    CHECK(strcmp(slice_text, "word007") == 0);
+    CHECK(ls_pack_slice_copy(text, &scan.words[7].translation, slice_text,
+                             sizeof(slice_text)));
+    CHECK(strcmp(slice_text, "学习7") == 0);
+
+    // Rejection parity with the parser: scan and parse must agree on status.
+    // 1. Corrupted CRC.
+    char *hit = NULL;
+    memcpy(copy, text, len);
+    hit = strstr(copy, "WORD|1001");
+    CHECK(hit != NULL);
+    if (hit) {
+        hit[8] = '2';
+        CHECK(ls_pack_scan_view(copy, len, &scan) == LS_ERR_CHECKSUM);
+        CHECK(ls_pack_parse(copy, len, &rejected) == LS_ERR_CHECKSUM);
+    }
+
+    // 2. ASCII-only translation (same byte length, fresh CRC via finalize).
+    memcpy(copy, text, len);
+    char *cjk = strstr(copy, "\xE5\xAD\xA6\xE4\xB9\xA0" "7");
+    CHECK(cjk != NULL);
+    if (cjk) {
+        memcpy(cjk, "xuexi 7", 7);
+        size_t copy_len = len;
+        CHECK(ls_pack_finalize(copy, &copy_len, sizeof(copy)));
+        CHECK(ls_pack_scan_view(copy, copy_len, &scan) == LS_ERR_FORMAT);
+        CHECK(ls_pack_parse(copy, copy_len, &rejected) == LS_ERR_FORMAT);
+    }
+
+    // 3. Word referencing a lesson that is not in the pack.
+    memcpy(copy, text, len);
+    hit = strstr(copy, "WORD|1001|1|");
+    CHECK(hit != NULL);
+    if (hit) {
+        hit[10] = '2';
+        size_t copy_len = len;
+        CHECK(ls_pack_finalize(copy, &copy_len, sizeof(copy)));
+        CHECK(ls_pack_scan_view(copy, copy_len, &scan) == LS_ERR_FORMAT);
+        CHECK(ls_pack_parse(copy, copy_len, &rejected) == LS_ERR_FORMAT);
+    }
+
+    // 4. Duplicate word text (case-insensitive contract).
+    memcpy(copy, text, len);
+    hit = strstr(copy, "|word001|");
+    CHECK(hit != NULL);
+    if (hit) {
+        hit[7] = '0';
+        size_t copy_len = len;
+        CHECK(ls_pack_finalize(copy, &copy_len, sizeof(copy)));
+        CHECK(ls_pack_scan_view(copy, copy_len, &scan) == LS_ERR_FORMAT);
+        CHECK(ls_pack_parse(copy, copy_len, &rejected) == LS_ERR_FORMAT);
+    }
+
     // The online worker stages a generated reply in the 60-word model. The
     // smaller parse must produce the same data before the UI copies it into the
     // active pack, so no 25 KiB allocation is needed next to the reply buffer.
@@ -228,7 +296,7 @@ static void test_content(void)
     CHECK(found != NULL);
     if (found) {
         found[8] = '2'; // 1001 -> 1002: still well-formed, wrong CRC
-        CHECK(ls_pack_parse(copy, len, &parsed) == LS_ERR_CHECKSUM);
+        CHECK(ls_pack_parse(copy, len, &rejected) == LS_ERR_CHECKSUM);
     }
 
     // The parser accepts any count up to the 100-word capacity, so the
@@ -467,6 +535,55 @@ static void test_remap_and_prune(void)
     size_t removed = ls_progress_prune(&progress, &old_pack);
     CHECK(removed == 1);
     CHECK(progress.record_count == LS_PROGRESS_RECORDS_MAX - 1);
+}
+
+// The online refresh hands the UI the finalized text plus its slice index (not
+// a parsed model). Progress must survive that path exactly as it does with the
+// parsed-model remap above.
+static void test_scan_and_slice_remap(void)
+{
+    static ls_pack_t old_pack;
+    static ls_pack_t new_pack;
+    static ls_pack_t activated;
+    static ls_progress_t progress;
+    static char text[LS_PACK_TEXT_MAX];
+    static ls_pack_slice_view_t scan;
+    size_t len = 0;
+
+    make_pack(&old_pack);
+    new_pack = old_pack;
+    ls_pack_assign_generated_ids(&new_pack);
+    CHECK(new_pack.words[0].id != old_pack.words[0].id);
+
+    CHECK(ls_pack_write(&new_pack, text, sizeof(text), &len) == LS_OK);
+    CHECK(ls_pack_scan_view(text, len, &scan) == LS_OK);
+    CHECK(scan.word_count == LS_WORD_TARGET);
+
+    ls_progress_init(&progress);
+    ls_progress_answer(&progress, old_pack.words[0].id, true);
+    ls_progress_answer(&progress, old_pack.words[1].id, false);
+
+    size_t copied = ls_progress_remap_slices(&progress, &old_pack, text, &scan);
+    CHECK(copied == 2);
+
+    // The IDs produced by the slice remap must be the exact ones the UI gets
+    // from ls_pack_parse() + ls_pack_assign_ids().
+    CHECK(ls_pack_parse(text, len, &activated) == LS_OK);
+    ls_pack_assign_ids(activated.words, activated.word_count);
+    CHECK(ls_progress_find(&progress, activated.words[0].id) != NULL);
+    CHECK(ls_progress_find(&progress, activated.words[1].id) != NULL);
+    const ls_progress_record_t *record =
+        ls_progress_find_const(&progress, activated.words[0].id);
+    CHECK(record != NULL && record->box == 1 && record->correct == 1);
+    record = ls_progress_find_const(&progress, activated.words[1].id);
+    CHECK(record != NULL && record->box == 0 && record->wrong == 1);
+
+    // The UI drops superseded IDs right after activating the new pack.
+    ls_progress_drop_missing_words(&progress, activated.words,
+                                   activated.word_count);
+    CHECK(ls_progress_find_const(&progress, old_pack.words[0].id) == NULL);
+    CHECK(ls_progress_find_const(&progress, old_pack.words[1].id) == NULL);
+    CHECK(progress.record_count == 2);
 }
 
 static void test_json_and_gen(void)
@@ -756,9 +873,10 @@ static void test_sanitize_pack(void)
                                 LS_WORD_MIN_ACCEPT));
 
     // IELTS-style reply: IPA in pron, an overlong meaning, curly quotes in the
-    // example, a duplicate word, an empty translation and a WORD line missing
-    // its pron field. The strict parser returns LS_ERR_RANGE on the IPA alone;
-    // the sanitizer repairs what it can and drops only the unusable words.
+    // example, a duplicate word, an empty translation, a WORD line missing its
+    // pron field and one with an empty pron field. The strict parser returns
+    // LS_ERR_RANGE on the IPA alone; the sanitizer repairs what it can and
+    // drops only the unusable words.
     static char model[LS_PACK_TEXT_MAX];
     size_t model_len = 0;
     int w = snprintf(model, sizeof(model), "LSPACK|2|1|60\nLESSON|1|Basics\n");
@@ -784,6 +902,7 @@ static void test_sanitize_pack(void)
         if (i == 2) example = "\xE2\x80\x9Cquoted\xE2\x80\x9D";
         const char *pron = "B AE T";
         if (i == 0) pron = "/\xCB\x88ten\xC9\x99nt/";
+        if (i == 6) pron = "";
 
         char text[256];
         if (i == 5) {
@@ -809,7 +928,13 @@ static void test_sanitize_pack(void)
                                LS_WORD_MIN_ACCEPT));
     static ls_pack_t repaired;
     CHECK(ls_pack_parse(model, model_sz, &repaired) == LS_OK);
-    CHECK(repaired.word_count == LS_WORD_TARGET - 3);
+    // Dropped: duplicate text (3), empty translation (4), missing pron field
+    // (5) and empty pron field (6). A card without a transcription can neither
+    // show IPA nor speak, so it never reaches the learner.
+    CHECK(repaired.word_count == LS_WORD_TARGET - 4);
+    for (uint16_t i = 0; i < repaired.word_count; i++) {
+        CHECK(repaired.words[i].pron[0] != '\0');
+    }
     // IPA is converted, not cleared, even though the ARPAbet is a little longer.
     CHECK(strcmp(repaired.words[0].pron, "T 'EH N AH N T") == 0);
     CHECK(strlen(repaired.words[1].meaning) == LS_MEANING_MAX);
@@ -1199,6 +1324,7 @@ int main(void)
     test_progress_and_session();
     test_session_rotation();
     test_remap_and_prune();
+    test_scan_and_slice_remap();
     test_json_and_gen();
     test_gen_seed_and_history();
     test_sanitize_pack();

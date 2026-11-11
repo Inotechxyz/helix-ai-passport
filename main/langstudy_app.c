@@ -24,6 +24,7 @@
 #include "langstudy_voice.h"
 #include "langstudy_progress.h"
 #include "langstudy_provision.h"
+#include "langstudy_splash.h"
 #include "langstudy_state.h"
 #include "langstudy_status_cache.h"
 #include "langstudy_store.h"
@@ -44,6 +45,7 @@
 #define LS_APP_TASK_STACK 6144
 #define LS_APP_TASK_PRIO 5
 #define LS_KEY_GUARD_MAX_US (10LL * 1000 * 1000)
+#define LS_SPLASH_DURATION_US (5LL * 1000 * 1000)
 
 static const char *TAG = "ls_app";
 
@@ -109,8 +111,9 @@ static void enter_deep_sleep(void)
         ESP_LOGW(TAG, "GPIO wake arm failed: %s", esp_err_to_name(err));
     }
 
-    // The wake is a reset, so the header can only show what was saved here.
-    // Read the gauge while it is still awake, then let it sleep.
+    // Only the battery fill survives the reset; the link icons are re-probed
+    // by the next boot. Read the gauge while it is still awake, then let it
+    // sleep.
     int soc = bsp_battery_soc();
     if (soc >= 0) {
         ls_status_cache_set_soc(soc);
@@ -160,19 +163,9 @@ static bool load_state(void)
         }
     }
 
-    // Deep sleep reboots the chip, so the link markers would otherwise vanish
-    // on every wake until the next online operation. Restore the last result
-    // saved before the previous sleep; a cold boot has no cache and shows
-    // nothing, which is the honest state there.
-    ls_status_cache_t cached;
-    if (ls_status_cache_get(&cached)) {
-        state->wifi_ok = cached.wifi_ok;
-        state->deepseek_ok = cached.deepseek_ok;
-        ESP_LOGI(TAG, "header status restored (wifi=%d deepseek=%d soc=%d)",
-                 (int)cached.wifi_ok, (int)cached.deepseek_ok, cached.soc);
-    } else {
-        ESP_LOGI(TAG, "header status cache empty");
-    }
+    // Link markers are deliberately not restored here: a boot/wake probe in
+    // ls_app_start() re-checks Wi-Fi and DeepSeek so the header never shows a
+    // stale result from before the last reset.
 
     if (!ls_store_load_pack(&state->pack, &state->store)) {
         ESP_LOGE(TAG, "no usable pack; trying the built-in body directly");
@@ -242,7 +235,8 @@ esp_err_t ls_app_start(void)
     ESP_LOGI(TAG, "PASSPORT ENGLISH booting");
 
     const uint32_t causes = esp_sleep_get_wakeup_causes();
-    if (causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
+    const bool key_wake = (causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) != 0;
+    if (key_wake) {
         key_guard_arm(&s_key_guard, esp_timer_get_time(), LS_KEY_GUARD_MAX_US);
         ESP_LOGI(TAG, "key wake: suppressing actions until the key is released");
     }
@@ -269,8 +263,22 @@ esp_err_t ls_app_start(void)
     // preference once NVS has been read.
     bsp_display_backlight(100);
 
+    // The dedication screen belongs to power-on, reset and esp_restart(); a
+    // deep-sleep key wake (the only sleep wake source this app arms) returns
+    // straight to the study screen.
+    bool splash = false;
+    int64_t splash_start_us = 0;
+    if (!key_wake) {
+        splash = (ls_splash_show() == ESP_OK);
+        splash_start_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "launch screen %s", splash ? "shown" : "unavailable");
+    }
+
     if (!load_state()) {
         ESP_LOGE(TAG, "no content available; cannot start the UI");
+        // Leave the dedication on screen rather than a black panel, but say
+        // why: this state never reaches the key handler or an error screen.
+        if (splash) ls_splash_set_caption("NO CONTENT");
         return ESP_FAIL;
     }
 
@@ -291,12 +299,34 @@ esp_err_t ls_app_start(void)
                                                   : LS_VOLUME_DEFAULT);
     if (ls_online_init() != ESP_OK) {
         ESP_LOGW(TAG, "online worker unavailable; offline only");
+    } else if (ls_config_has_wifi(&ls_state()->config)) {
+        // Re-check both links after every boot and wake instead of trusting a
+        // value saved before the reset. The result only moves the header icons;
+        // running it during the splash usually fills them before the UI shows.
+        if (!ls_online_start(LS_ONLINE_PROBE)) {
+            ESP_LOGW(TAG, "boot link probe could not start");
+        }
+    }
+
+    if (splash) {
+        // Keep the dedication up for five seconds. Initialisation above already
+        // ran behind it, so this is a visible, marked wait rather than dead
+        // time; never hold the LVGL lock across the delay.
+        for (;;) {
+            int64_t elapsed = esp_timer_get_time() - splash_start_us;
+            if (elapsed >= LS_SPLASH_DURATION_US) break;
+            ls_splash_set_progress((uint32_t)(elapsed * 1000 /
+                                              LS_SPLASH_DURATION_US));
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        ls_splash_set_progress(1000);
     }
 
     if (ls_ui_init() != ESP_OK) {
         ESP_LOGE(TAG, "UI init failed");
         return ESP_FAIL;
     }
+    if (splash) ls_splash_hide();
 
     s_input_queue = xQueueCreate(LS_INPUT_QUEUE_DEPTH, sizeof(input_event_t));
     if (!s_input_queue) return ESP_ERR_NO_MEM;

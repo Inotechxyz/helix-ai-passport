@@ -144,11 +144,14 @@ bool ls_buddy_is_happy(const ls_buddy_t *buddy)
 }
 
 // Re-derive the stage from XP; report whether this is a new evolution.
+// Evolution is monotonic: the persisted stage wins when it is ahead of the XP
+// table, which keeps an already evolved buddy from regressing after the
+// thresholds are raised in a firmware update.
 static bool update_stage(ls_buddy_t *buddy)
 {
     uint8_t next = ls_buddy_stage_for_xp(buddy->xp);
     if (next > LS_BUDDY_STAGE_COUNT - 1) next = LS_BUDDY_STAGE_COUNT - 1;
-    if (next == buddy->stage) return false;
+    if (next <= buddy->stage) return false;
     buddy->stage = next;
     return true;
 }

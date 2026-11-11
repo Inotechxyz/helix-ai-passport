@@ -26,6 +26,8 @@
 | [`images/logo-wordmark.png`](images/logo-wordmark.png) | 1648 × 336，PNG RGBA | 从仓库原始 `images/logo.png` 中精确裁切并去除背景的黑色字标；用于中英文项目 README 的浅色主题。 |
 | [`images/logo-wordmark-dark.png`](images/logo-wordmark-dark.png) | 1648 × 336，PNG RGBA | 提取字标的白色版本；README 使用 `<picture>` 在 GitHub 深色主题下显示。 |
 
+启动画面由脚本生成，不存放在本目录。`tools/gen_splash.py`（Pillow）以固定的随机种子绘制 120 × 96 的场景，用最近邻放大 2 倍，并把 240 × 192 的小端 RGB565 数组和 `lv_image_dsc_t` 输出到 `main/langstudy_splash_img.c` 和 `.h`（约占 92 KiB Flash）。脚本还会写出 `build/splash_preview.png`，它是构建产物，不提交。运行 `python3 tools/gen_splash.py --check-only` 可校验已提交文件是否最新。题献字符串只出现在 `main/langstudy_splash.c`。
+
 - 使用描述性命名，并记录尺寸、像素格式、转换步骤与目标路径。
 - 优先采用适合 240 × 320 RGB565 显示的格式，并纳入 Flash 与内部 RAM 考量。
 - 许可允许时保留可编辑源文件，并记录来源与许可。

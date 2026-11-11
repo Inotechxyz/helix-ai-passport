@@ -65,6 +65,16 @@ size_t ls_progress_remap_words(ls_progress_t *progress,
                                const ls_word_t *old_words, uint16_t old_count,
                                const ls_word_t *new_words, uint16_t new_count);
 
+// Same remap as ls_progress_remap_words(), but the new words are the slice
+// index of a generated pack text (see ls_pack_scan_view() in
+// langstudy_content.h). The new IDs are computed exactly as
+// ls_pack_assign_ids() will assign them once the UI parses the text. Call
+// before the active pack is overwritten.
+struct ls_pack_slice_view_t;
+size_t ls_progress_remap_slices(ls_progress_t *progress,
+                                const ls_pack_t *old_pack, const char *text,
+                                const struct ls_pack_slice_view_t *scan);
+
 // Remove every record whose word ID is absent from the pack. Call after
 // ls_progress_remap_text() so the superseded IDs do not linger. Returns the
 // number removed.

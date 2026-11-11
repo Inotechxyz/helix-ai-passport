@@ -506,6 +506,220 @@ ls_status_t ls_pack_parse(const char *text, size_t len, ls_pack_t *out)
 }
 
 // ---------------------------------------------------------------------------
+// Slice scan
+// ---------------------------------------------------------------------------
+//
+// The online worker must validate a generated pack without allocating a
+// content-sized model: after Wi-Fi/TLS the ESP32-C3 heap reports tens of
+// kilobytes free but the largest contiguous block is only a few kilobytes, so
+// malloc(sizeof(ls_gen_pack_t)) fails. This scan applies the same checks as
+// ls_pack_parse_view() and records where each field lives in the reply text.
+
+bool ls_pack_slice_copy(const char *text, const ls_pack_slice_t *slice,
+                        char *dst, size_t cap)
+{
+    if (!text || !slice || !dst || cap == 0) return false;
+    if ((size_t)slice->len + 1 > cap) return false;
+    memcpy(dst, text + slice->off, slice->len);
+    dst[slice->len] = '\0';
+    return true;
+}
+
+static bool slice_equals_ci(const char *text, const ls_pack_slice_t *a,
+                            const ls_pack_slice_t *b)
+{
+    if (a->len != b->len) return false;
+    for (uint16_t i = 0; i < a->len; i++) {
+        unsigned char ca = (unsigned char)text[a->off + i];
+        unsigned char cb = (unsigned char)text[b->off + i];
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Trim one field and store its bounds. Returns false when the trimmed value
+// exceeds the format limit or carries a character the line format forbids;
+// callers treat that like copy_field's failure (LS_ERR_RANGE).
+static bool scan_slice(const char *text, const field_t *field, size_t max_len,
+                       bool utf8, ls_pack_slice_t *out)
+{
+    size_t begin;
+    size_t end;
+    trim_bounds(field->ptr, field->len, &begin, &end);
+    size_t trimmed = end - begin;
+    out->off = (uint16_t)(field->ptr + begin - text);
+    out->len = (uint16_t)trimmed;
+    if (trimmed > max_len) return false;
+    return utf8 ? utf8_chars_ok(field->ptr + begin, trimmed)
+                : field_chars_ok(field->ptr + begin, trimmed);
+}
+
+static const ls_lesson_slice_t *scan_find_lesson(const ls_lesson_slice_t *lessons,
+                                                 uint16_t count, uint32_t id)
+{
+    for (uint16_t i = 0; i < count; i++) {
+        if (lessons[i].id == id) return &lessons[i];
+    }
+    return NULL;
+}
+
+ls_status_t ls_pack_scan_view(const char *text, size_t len,
+                              ls_pack_slice_view_t *out)
+{
+    if (!text || !out) return LS_ERR_ARG;
+    if (len == 0 || len > LS_PACK_TEXT_MAX) return LS_ERR_SIZE;
+    if (len < 2 || text[len - 1] != '\n') return LS_ERR_FORMAT;
+    if (memchr(text, '\0', len)) return LS_ERR_FORMAT;
+
+    out->lesson_count = 0;
+    out->word_count = 0;
+
+    size_t pos = 0;
+    bool header_seen = false;
+    bool end_seen = false;
+    uint32_t expected_lessons = 0;
+    uint32_t expected_words = 0;
+    uint32_t crc = 0xFFFFFFFFu;
+
+    while (pos < len) {
+        const char *line = text + pos;
+        const char *newline = memchr(line, '\n', len - pos);
+        if (!newline) return LS_ERR_FORMAT;
+        size_t line_len = (size_t)(newline - line);
+        if (line_len > LINE_MAX_BYTES) return LS_ERR_SIZE;
+        if (memchr(line, '\r', line_len)) return LS_ERR_FORMAT;
+
+        field_t fields[FIELD_MAX];
+        size_t count = split_line(line, line_len, '|', fields,
+                                  sizeof(fields) / sizeof(fields[0]));
+        if (count == 0 || count > FIELD_MAX) return LS_ERR_FORMAT;
+
+        if (!header_seen) {
+            uint32_t version;
+            if (count != 4 || fields[0].len != 6 ||
+                memcmp(fields[0].ptr, "LSPACK", 6) != 0 ||
+                !parse_u32(&fields[1], &version) || version != LS_FORMAT_VERSION ||
+                !parse_u32(&fields[2], &expected_lessons) ||
+                !parse_u32(&fields[3], &expected_words)) {
+                return LS_ERR_FORMAT;
+            }
+            if (expected_lessons == 0 || expected_lessons > LS_LESSONS_MAX ||
+                expected_words == 0 || expected_words > LS_GEN_WORDS_MAX) {
+                return LS_ERR_RANGE;
+            }
+            header_seen = true;
+            crc = update_crc(crc, line, line_len + 1);
+            pos += line_len + 1;
+            continue;
+        }
+
+        if (count >= 1 && fields[0].len == 3 &&
+            memcmp(fields[0].ptr, "END", 3) == 0) {
+            uint32_t expected_crc;
+            if (count != 2 || !parse_hex32(&fields[1], &expected_crc)) {
+                return LS_ERR_FORMAT;
+            }
+            if (~crc != expected_crc) return LS_ERR_CHECKSUM;
+            if (pos + line_len + 1 != len) return LS_ERR_FORMAT;
+            end_seen = true;
+            pos = len;
+            break;
+        }
+
+        if (count >= 1 && fields[0].len == 6 &&
+            memcmp(fields[0].ptr, "LESSON", 6) == 0) {
+            if (count != 3) return LS_ERR_FORMAT;
+            if (out->lesson_count >= LS_LESSONS_MAX) return LS_ERR_RANGE;
+            ls_lesson_slice_t *lesson = &out->lessons[out->lesson_count];
+            if (!parse_u32(&fields[1], &lesson->id) || lesson->id == 0) {
+                return LS_ERR_RANGE;
+            }
+            if (!scan_slice(text, &fields[2], LS_LESSON_TITLE_MAX, false,
+                            &lesson->title)) {
+                return LS_ERR_RANGE;
+            }
+            if (lesson->title.len == 0) return LS_ERR_FORMAT;
+            out->lesson_count++;
+        } else if (count >= 1 && fields[0].len == 4 &&
+                   memcmp(fields[0].ptr, "WORD", 4) == 0) {
+            if (count != 9) return LS_ERR_FORMAT;
+            if (out->word_count >= LS_GEN_WORDS_MAX) return LS_ERR_RANGE;
+            ls_word_slice_t *word = &out->words[out->word_count];
+            if (!parse_u32(&fields[1], &word->id) || word->id == 0) {
+                return LS_ERR_RANGE;
+            }
+            if (!parse_u32(&fields[2], &word->lesson_id) || word->lesson_id == 0) {
+                return LS_ERR_RANGE;
+            }
+            if (!scan_slice(text, &fields[3], LS_WORD_TEXT_MAX, false,
+                            &word->text) ||
+                !scan_slice(text, &fields[4], LS_POS_MAX, false, &word->pos) ||
+                !scan_slice(text, &fields[5], LS_MEANING_MAX, false,
+                            &word->meaning) ||
+                !scan_slice(text, &fields[6], LS_TRANSLATION_MAX, true,
+                            &word->translation) ||
+                !scan_slice(text, &fields[7], LS_EXAMPLE_MAX, false,
+                            &word->example) ||
+                !scan_slice(text, &fields[8], LS_PRON_MAX, false,
+                            &word->pron)) {
+                return LS_ERR_RANGE;
+            }
+            if (word->text.len == 0 || word->meaning.len == 0 ||
+                word->translation.len == 0) {
+                return LS_ERR_FORMAT;
+            }
+            out->word_count++;
+        } else {
+            return LS_ERR_FORMAT;
+        }
+
+        crc = update_crc(crc, line, line_len + 1);
+        pos += line_len + 1;
+    }
+
+    if (!header_seen || !end_seen) return LS_ERR_FORMAT;
+    if (out->lesson_count != expected_lessons ||
+        out->word_count != expected_words) {
+        return LS_ERR_RANGE;
+    }
+    if (out->lesson_count == 0 || out->word_count == 0) return LS_ERR_FORMAT;
+
+    // Cross-field checks ls_pack_parse_view() performs after the CRC walk
+    // (validate_pack_data), in the same order, so both return the same status
+    // for every input.
+    for (uint16_t i = 0; i < out->lesson_count; i++) {
+        for (uint16_t j = 0; j < i; j++) {
+            if (out->lessons[j].id == out->lessons[i].id) return LS_ERR_FORMAT;
+        }
+    }
+    for (uint16_t i = 0; i < out->word_count; i++) {
+        const ls_word_slice_t *word = &out->words[i];
+        if (!scan_find_lesson(out->lessons, out->lesson_count,
+                              word->lesson_id)) {
+            return LS_ERR_FORMAT;
+        }
+        if (!has_non_ascii(text + word->translation.off,
+                           word->translation.len)) {
+            return LS_ERR_FORMAT;
+        }
+        char pron[LS_PRON_MAX + 1];
+        if (!ls_pack_slice_copy(text, &word->pron, pron, sizeof(pron)) ||
+            !ls_pron_validate(pron)) {
+            return LS_ERR_FORMAT;
+        }
+        for (uint16_t j = 0; j < i; j++) {
+            if (out->words[j].id == word->id) return LS_ERR_FORMAT;
+            if (slice_equals_ci(text, &out->words[j].text, &word->text)) {
+                return LS_ERR_FORMAT;
+            }
+        }
+    }
+    return LS_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
 
@@ -679,7 +893,10 @@ bool ls_pack_finalize(char *text, size_t *len, size_t cap)
     }
 
     // Drop a caller/model-supplied END line so the CRC is always recomputed.
+    // Skip the terminating newline first: otherwise the scan starts past the
+    // last line and never sees its "END|" prefix.
     size_t line_start = used;
+    if (line_start > 0 && text[line_start - 1] == '\n') line_start--;
     while (line_start > 0 && text[line_start - 1] != '\n') line_start--;
     if (line_start < used && used - line_start >= 4 &&
         memcmp(text + line_start, "END|", 4) == 0) {

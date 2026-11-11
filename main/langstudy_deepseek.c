@@ -243,12 +243,32 @@ esp_err_t ls_deepseek_generate(const ls_deepseek_cfg_t *cfg,
     for (;;) {
         int read = esp_http_client_read(client, chunk, sizeof(chunk));
         if (read < 0) {
-            set_error("response read failed: errno=%d (after %u bytes)",
-                      esp_http_client_get_errno(client),
-                      (unsigned)content_len);
-            ESP_LOGE(TAG, "HTTPS 响应读取失败, errno=%d, 剩余堆=%u 字节",
-                     esp_http_client_get_errno(client),
-                     (unsigned)esp_get_free_heap_size());
+            // A failed read can be a socket error or an allocation failure
+            // inside the AES-DMA path; errno alone is 0 for the latter. The
+            // TLS error code names the real cause, and the DMA-capable heap
+            // numbers show whether the driver ran out of buffers even though
+            // other heap regions still had bytes free.
+            int tls_error = 0;
+            int tls_flags = 0;
+            (void)esp_http_client_get_and_clear_last_tls_error(
+                client, &tls_error, &tls_flags);
+            unsigned dma_free =
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA);
+            unsigned dma_largest =
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+            set_error("response read failed: ret=%d errno=%d tls=%d "
+                      "(after %u bytes, dma free=%u)",
+                      read, esp_http_client_get_errno(client), tls_error,
+                      (unsigned)content_len, dma_free);
+            ESP_LOGE(TAG, "HTTPS 响应读取失败, ret=%d, errno=%d, TLS错误=%d, "
+                     "证书标志=0x%x, 剩余堆=%u, 最大连续=%u, DMA剩余=%u, "
+                     "DMA最大=%u 字节",
+                     read, esp_http_client_get_errno(client), tls_error,
+                     (unsigned)tls_flags,
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(
+                         MALLOC_CAP_DEFAULT),
+                     dma_free, dma_largest);
             err = ESP_FAIL;
             goto cleanup;
         }

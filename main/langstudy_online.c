@@ -45,24 +45,34 @@ static QueueHandle_t s_requests;
 static QueueHandle_t s_results;
 static TaskHandle_t s_task;
 static volatile bool s_busy;
+// True while the in-flight request is the silent boot/wake probe. Cleared with
+// s_busy so an error path cannot leave it stuck.
+static volatile bool s_probe_pending;
+// Slice index of the most recent generated pack (worker task only). A parsed
+// model would need a ~15 KiB contiguous allocation after Wi-Fi/TLS, which this
+// SRAM-only board cannot reliably provide once the heap is fragmented; this
+// fixed-size index stays in BSS and lets the UI re-scan the text it receives.
+static ls_pack_slice_view_t s_scan;
 
 static void post_message(ls_online_msg_kind_t kind, const char *message,
-                         const char *detail, ls_gen_pack_t *pack,
+                         const char *detail, char *text, size_t text_len,
                          ls_progress_t *progress, uint8_t link_flags)
 {
     ls_online_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.kind = kind;
-    msg.pack = pack;
+    msg.text = text;
+    msg.text_len = text ? text_len : 0;
     msg.progress = progress;
     msg.link_flags = link_flags;
     snprintf(msg.message, sizeof(msg.message), "%s",
              message ? message : "");
     snprintf(msg.detail, sizeof(msg.detail), "%s", detail ? detail : "");
     if (!s_results || xQueueSend(s_results, &msg, 0) != pdTRUE) {
-        free(pack);
+        free(text);
         free(progress);
     }
+    s_probe_pending = false;
     s_busy = false;
 }
 
@@ -162,18 +172,22 @@ static void build_avoid_words(const ls_pack_t *pack,
 
 // Copy up to a handful of repeated words into `out` for the detail screen.
 // Returns the total number of repeats (which may exceed what fits).
-static uint16_t collect_repeated_words(const ls_word_t *words, uint16_t count,
-                                       const char *avoid, char *out,
-                                       size_t cap)
+static uint16_t collect_repeated_slices(const char *text,
+                                        const ls_word_slice_t *words,
+                                        uint16_t count, const char *avoid,
+                                        char *out, size_t cap)
 {
     uint16_t repeated = 0;
     size_t used = 0;
     if (!out || cap == 0) return 0;
     out[0] = '\0';
-    if (!words || !avoid || !avoid[0]) return 0;
+    if (!text || !words || !avoid || !avoid[0]) return 0;
 
     for (size_t i = 0; i < count; i++) {
-        const char *word = words[i].text;
+        char word[LS_WORD_TEXT_MAX + 1];
+        if (!ls_pack_slice_copy(text, &words[i].text, word, sizeof(word))) {
+            continue;
+        }
         if (!word_in_avoid_list(word, avoid)) continue;
         repeated++;
         size_t len = strlen(word);
@@ -267,16 +281,16 @@ static void do_refresh(online_request_t *request)
     if (request->config.api_key[0] == '\0') {
         post_message(LS_ONLINE_REFRESH_FAIL,
                      "Set the DeepSeek API key in setup",
-                     "Phone setup -> DeepSeek API key", NULL, NULL, 0);
+                     "Phone setup -> DeepSeek API key", NULL, 0, NULL, 0);
         return;
     }
     if (request->config.wifi_ssid[0] == '\0') {
         post_message(LS_ONLINE_REFRESH_FAIL, "Set up Wi-Fi first",
-                     "Phone setup -> Wi-Fi network", NULL, NULL, 0);
+                     "Phone setup -> Wi-Fi network", NULL, 0, NULL, 0);
         return;
     }
     if (!start_radio(request, error, sizeof(error))) {
-        post_message(LS_ONLINE_REFRESH_FAIL, error, error, NULL, NULL, 0);
+        post_message(LS_ONLINE_REFRESH_FAIL, error, error, NULL, 0, NULL, 0);
         return;
     }
 
@@ -300,13 +314,13 @@ static void do_refresh(online_request_t *request)
     // One automatic retry when the reply is malformed or truncated. Reused
     // vocabulary is accepted with a notice instead: a repeat is a quality
     // signal, not a reason to keep the learner waiting for another generation.
-    ls_gen_pack_t *pack = NULL;
+    char *text = NULL;
+    size_t len = 0;
     esp_err_t err = ESP_OK;
     bool radio_up = true;
     for (int attempt = 0; attempt < 2; attempt++) {
-        char *text = NULL;
-        size_t len = 0;
-        pack = NULL;
+        text = NULL;
+        len = 0;
         detail[0] = '\0';
         cfg.strict_avoid = attempt > 0;
         // Retrying with the same seed invites the same sample again; mix the
@@ -317,89 +331,61 @@ static void do_refresh(online_request_t *request)
         err = ls_deepseek_generate(&cfg, &text, &len);
 
         // The HTTP client is already closed, but the Wi-Fi stack still holds
-        // tens of kilobytes. Shut it down before allocating the parsed model:
-        // on the SRAM-only ESP32-C3 keeping both live produced the "Out of
-        // memory" failure reported after a 100-word refresh.
+        // tens of kilobytes. Shut it down before validating so the next attempt
+        // (or the caller) starts from a settled radio state.
         stop_radio();
         radio_up = false;
 
         if (err == ESP_OK) {
-            // Parse into the smaller staging model. The 100-word ls_pack_t is
-            // 25 KiB and, with the 16 KiB reply still allocated, fragmentation
-            // after a live TLS session made that allocation fail on this
-            // SRAM-only board ("out of memory for parsed pack ... free=101504").
-            // LS_GEN_WORDS_MAX (60) keeps the staging allocation near 15 KiB,
-            // inside the size class the reply buffer itself already proved
-            // available. The UI copies it into the active pack afterwards.
-            pack = (ls_gen_pack_t *)malloc(sizeof(*pack));
-            if (!pack) {
-                // The radio is already down here, so a failure means the heap
-                // is genuinely exhausted rather than fragmented by TLS.
+            // Validate and index the finalized reply without allocating a
+            // content-sized model. A ~15 KiB contiguous allocation after a
+            // live TLS session failed on this SRAM-only board even with tens of
+            // kilobytes of total free heap; s_scan is fixed-size BSS, and the
+            // UI parses the text into the resident active pack. Scan-OK means
+            // ls_pack_parse() on the same text cannot fail.
+            ls_status_t scanned = ls_pack_scan_view(text, len, &s_scan);
+            if (scanned != LS_OK) {
                 snprintf(detail, sizeof(detail),
-                         "out of memory for parsed pack (%u bytes, free=%u)",
-                         (unsigned)sizeof(*pack),
-                         (unsigned)esp_get_free_heap_size());
-                ESP_LOGE(TAG, "分配解析模型失败(%u 字节), 剩余堆=%u, "
-                              "最大连续=%u 字节",
-                         (unsigned)sizeof(*pack),
-                         (unsigned)esp_get_free_heap_size(),
-                         (unsigned)heap_caps_get_largest_free_block(
-                             MALLOC_CAP_DEFAULT));
-                err = ESP_ERR_NO_MEM;
+                         "pack parse failed (status %d, %u bytes): %.96s",
+                         (int)scanned, (unsigned)len, text);
+                err = ESP_ERR_INVALID_RESPONSE;
             } else {
-                ls_pack_view_t view = {
-                    .lesson_cap = LS_LESSONS_MAX,
-                    .word_cap = LS_GEN_WORDS_MAX,
-                    .lessons = pack->lessons,
-                    .words = pack->words,
-                };
-                ls_status_t parsed = ls_pack_parse_view(text, len, &view);
-                pack->lesson_count = view.lesson_count;
-                pack->word_count = view.word_count;
-                if (parsed != LS_OK) {
+                // Repeats are reported, not fatal. The pack is still an
+                // improvement over stalling at 100% completion, and the status
+                // screen names the words that came back.
+                char words[LS_ONLINE_DETAIL_MAX];
+                uint16_t repeated_count = collect_repeated_slices(
+                    text, s_scan.words, s_scan.word_count,
+                    request->avoid_words, words, sizeof(words));
+                if (repeated_count > 0) {
+                    // The list is already capped, but a precision keeps the
+                    // prefix and list within the detail buffer.
                     snprintf(detail, sizeof(detail),
-                             "pack parse failed (status %d, %u bytes): %.96s",
-                             (int)parsed, (unsigned)len, text);
-                    err = ESP_ERR_INVALID_RESPONSE;
-                } else {
-                    // Replace model-chosen ids with the stable FNV ids the
-                    // progress records key on.
-                    ls_pack_assign_ids(pack->words, pack->word_count);
-                    if (!ls_pack_validate_view(&view)) {
-                        snprintf(detail, sizeof(detail),
-                                 "pack validation failed (%u words, %u lessons)",
-                                 (unsigned)pack->word_count,
-                                 (unsigned)pack->lesson_count);
-                        err = ESP_ERR_INVALID_RESPONSE;
-                    } else {
-                        // Repeats are reported, not fatal. The pack is still an
-                        // improvement over stalling at 100% completion, and the
-                        // status screen names the words that came back.
-                        char words[LS_ONLINE_DETAIL_MAX];
-                        uint16_t repeated_count = collect_repeated_words(
-                            pack->words, pack->word_count, request->avoid_words,
-                            words, sizeof(words));
-                        if (repeated_count > 0) {
-                            // The list is already capped, but a precision keeps
-                            // the prefix and list within the detail buffer.
-                            snprintf(detail, sizeof(detail),
-                                     "%u repeated word(s): %.160s",
-                                     (unsigned)repeated_count, words);
-                            ESP_LOGW(TAG, "刷新结果包含已学单词(%u), 仍接受",
-                                     (unsigned)repeated_count);
-                        }
-                    }
+                             "%u repeated word(s): %.160s",
+                             (unsigned)repeated_count, words);
+                    ESP_LOGW(TAG, "刷新结果包含已学单词(%u), 仍接受",
+                             (unsigned)repeated_count);
                 }
             }
         } else {
             snprintf(detail, sizeof(detail), "%s",
                      ls_deepseek_last_error());
+            if (err == ESP_ERR_NO_MEM) {
+                // The allocation that failed is inside the reply path; log the
+                // heap shape so a future report shows fragmentation, not just
+                // total free bytes.
+                size_t used = strlen(detail);
+                snprintf(detail + used, sizeof(detail) - used,
+                         "\nheap free=%u, largest=%u",
+                         (unsigned)esp_get_free_heap_size(),
+                         (unsigned)heap_caps_get_largest_free_block(
+                             MALLOC_CAP_DEFAULT));
+            }
         }
-        free(text);
 
         if (err == ESP_OK) break;
-        free(pack);
-        pack = NULL;
+        free(text);
+        text = NULL;
         // A malformed or truncated reply is worth one more call because long
         // completions are sometimes cut short; connectivity and memory
         // failures are not retried.
@@ -408,7 +394,7 @@ static void do_refresh(online_request_t *request)
         if (!retry || attempt + 1 >= 2) break;
         ESP_LOGW(TAG, "刷新结果不可用(%s), 重试一次", esp_err_to_name(err));
         if (!start_radio(request, error, sizeof(error))) {
-            post_message(LS_ONLINE_REFRESH_FAIL, error, error, NULL, NULL, 0);
+            post_message(LS_ONLINE_REFRESH_FAIL, error, error, NULL, 0, NULL, 0);
             return;
         }
         radio_up = true;
@@ -416,27 +402,28 @@ static void do_refresh(online_request_t *request)
 
     if (radio_up) stop_radio();
 
-    if (err == ESP_OK && pack) {
+    if (err == ESP_OK && text) {
         // A truncated IELTS generation may be accepted with fewer than 60
         // words, so report the count actually stored. `detail` is empty unless
         // the reply reused vocabulary, in which case the UI shows that notice.
+        // Ownership of the text buffer passes to the UI thread.
         char ready[32];
         snprintf(ready, sizeof(ready), "%u new words ready",
-                 (unsigned)pack->word_count);
-        post_message(LS_ONLINE_REFRESH_OK, ready, detail, pack, NULL,
+                 (unsigned)s_scan.word_count);
+        post_message(LS_ONLINE_REFRESH_OK, ready, detail, text, len, NULL,
                      LS_LINK_WIFI_KNOWN | LS_LINK_WIFI_OK |
                          LS_LINK_DEEPSEEK_KNOWN | LS_LINK_DEEPSEEK_OK);
         return;
     }
 
-    free(pack);
+    free(text);
     const char *message = deepseek_error_text(err);
     if (detail[0] == '\0') {
         snprintf(detail, sizeof(detail), "%s", esp_err_to_name(err));
     }
     ESP_LOGW(TAG, "刷新单词失败: %s (%s) [%s]", message,
              esp_err_to_name(err), detail);
-    post_message(LS_ONLINE_REFRESH_FAIL, message, detail, NULL, NULL,
+    post_message(LS_ONLINE_REFRESH_FAIL, message, detail, NULL, 0, NULL,
                  LS_LINK_WIFI_KNOWN | LS_LINK_WIFI_OK |
                      LS_LINK_DEEPSEEK_KNOWN);
 }
@@ -446,26 +433,26 @@ static void do_sync(online_request_t *request)
     char error[96];
     if (request->config.wifi_ssid[0] == '\0') {
         post_message(LS_ONLINE_SYNC_FAIL, "Set up Wi-Fi first",
-                     "Phone setup -> Wi-Fi network", NULL, NULL, 0);
+                     "Phone setup -> Wi-Fi network", NULL, 0, NULL, 0);
         return;
     }
     if (request->config.sync_url[0] == '\0') {
         post_message(LS_ONLINE_SYNC_FAIL, "Set the Azure SAS URL in setup",
-                     "Phone setup -> Azure Blob SAS URL", NULL, NULL, 0);
+                     "Phone setup -> Azure Blob SAS URL", NULL, 0, NULL, 0);
         return;
     }
     if (request->profile_id[0] == '\0') {
         post_message(LS_ONLINE_SYNC_FAIL, "Create a profile first",
-                     "Menu -> CREATE PROFILE", NULL, NULL, 0);
+                     "Menu -> CREATE PROFILE", NULL, 0, NULL, 0);
         return;
     }
     if (!request->progress) {
         post_message(LS_ONLINE_SYNC_FAIL, "No progress to sync",
-                     "Answer at least one card first", NULL, NULL, 0);
+                     "Answer at least one card first", NULL, 0, NULL, 0);
         return;
     }
     if (!start_radio(request, error, sizeof(error))) {
-        post_message(LS_ONLINE_SYNC_FAIL, error, error, NULL, NULL, 0);
+        post_message(LS_ONLINE_SYNC_FAIL, error, error, NULL, 0, NULL, 0);
         return;
     }
 
@@ -491,7 +478,7 @@ static void do_sync(online_request_t *request)
         post_message(LS_ONLINE_SYNC_OK,
                      sync_result.created ? "First sync uploaded"
                                          : "Progress synced",
-                     NULL, NULL, remote, wifi_flag);
+                     NULL, NULL, 0, remote, wifi_flag);
     } else {
         free(remote);
         char detail[LS_ONLINE_DETAIL_MAX];
@@ -517,7 +504,7 @@ static void do_sync(online_request_t *request)
         }
         ESP_LOGW(TAG, "同步失败: %s (HTTP %d)", esp_err_to_name(err),
                  sync_result.http_status);
-        post_message(LS_ONLINE_SYNC_FAIL, "Sync failed", detail, NULL, NULL,
+        post_message(LS_ONLINE_SYNC_FAIL, "Sync failed", detail, NULL, 0, NULL,
                      wifi_flag);
     }
 }
@@ -526,6 +513,14 @@ static void do_sync(online_request_t *request)
 // API key instead of a single opaque "online failed" message.
 static void do_check(online_request_t *request)
 {
+    // The boot/wake probe runs the same hops but reports silently: only the
+    // link flags matter, so the UI must not open a status screen.
+    const bool probe = request->op == LS_ONLINE_PROBE;
+    const ls_online_msg_kind_t fail_kind =
+        probe ? LS_ONLINE_PROBE_DONE : LS_ONLINE_CHECK_FAIL;
+    const ls_online_msg_kind_t ok_kind =
+        probe ? LS_ONLINE_PROBE_DONE : LS_ONLINE_CHECK_OK;
+
     char message[LS_ONLINE_MESSAGE_MAX];
     size_t pos = 0;
     message[0] = '\0';
@@ -533,14 +528,14 @@ static void do_check(online_request_t *request)
     if (request->config.wifi_ssid[0] == '\0') {
         add_line(message, sizeof(message), &pos, "Wi-Fi: not configured");
         add_line(message, sizeof(message), &pos, "DeepSeek: not tested");
-        post_message(LS_ONLINE_CHECK_FAIL, message, NULL, NULL, NULL, 0);
+        post_message(fail_kind, message, NULL, NULL, 0, NULL, 0);
         return;
     }
 
     esp_err_t err = ls_audio_release();
     if (err != ESP_OK) {
         add_line(message, sizeof(message), &pos, "Audio release failed");
-        post_message(LS_ONLINE_CHECK_FAIL, message, NULL, NULL, NULL, 0);
+        post_message(fail_kind, message, NULL, NULL, 0, NULL, 0);
         return;
     }
 
@@ -555,7 +550,7 @@ static void do_check(online_request_t *request)
         add_line(message, sizeof(message), &pos, "DeepSeek: not tested");
         ls_net_shutdown();
         ls_audio_resume();
-        post_message(LS_ONLINE_CHECK_FAIL, message, line, NULL, NULL,
+        post_message(fail_kind, message, line, NULL, 0, NULL,
                      LS_LINK_WIFI_KNOWN);
         return;
     }
@@ -604,8 +599,8 @@ static void do_check(online_request_t *request)
     }
 
     stop_radio();
-    post_message(all_ok ? LS_ONLINE_CHECK_OK : LS_ONLINE_CHECK_FAIL, message,
-                 NULL, NULL, NULL, link);
+    post_message(all_ok ? ok_kind : fail_kind, message, NULL, NULL, 0, NULL,
+                 link);
 }
 
 static void online_task(void *arg)
@@ -618,7 +613,10 @@ static void online_task(void *arg)
         }
         switch (request.op) {
         case LS_ONLINE_REFRESH: do_refresh(&request); break;
-        case LS_ONLINE_CHECK: do_check(&request); break;
+        case LS_ONLINE_CHECK:
+        case LS_ONLINE_PROBE:
+            do_check(&request);
+            break;
         default: do_sync(&request); break;
         }
         free(request.progress);
@@ -670,7 +668,7 @@ void ls_online_shutdown(void)
     if (s_results) {
         ls_online_msg_t msg;
         while (xQueueReceive(s_results, &msg, 0) == pdTRUE) {
-            free(msg.pack);
+            free(msg.text);
             free(msg.progress);
         }
         vQueueDelete(s_results);
@@ -679,6 +677,7 @@ void ls_online_shutdown(void)
     // The worker may have been deleted mid-request; make sure the radio is off
     // before the caller powers down I2C/display for deep sleep.
     ls_net_shutdown();
+    s_probe_pending = false;
     s_busy = false;
 }
 
@@ -715,9 +714,13 @@ bool ls_online_start(ls_online_op_t op)
                  ls_state()->profile_id);
     }
 
+    // Publish the probe flag before s_busy so a concurrent
+    // ls_online_probe_active() never sees busy without its kind.
+    s_probe_pending = (op == LS_ONLINE_PROBE);
     s_busy = true;
     if (xQueueSend(s_requests, &request, 0) != pdTRUE) {
         free(request.progress);
+        s_probe_pending = false;
         s_busy = false;
         return false;
     }
@@ -733,4 +736,9 @@ bool ls_online_poll(ls_online_msg_t *msg)
 bool ls_online_busy(void)
 {
     return s_busy;
+}
+
+bool ls_online_probe_active(void)
+{
+    return s_busy && s_probe_pending;
 }

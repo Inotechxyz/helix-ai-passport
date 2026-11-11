@@ -60,9 +60,19 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 # at init). Trimming them leaves more contiguous internal RAM for TLS and the
 # generated-pack buffer. Dynamic buffers are allocated on demand, so capping
 # them limits the peak without reserving RAM at idle.
+#
+# The dynamic caps are deliberately below the stock 32. While an SSE reply is
+# streaming, the live set is the 16.9 KiB pack buffer, the dynamic TLS record
+# buffer, and one Wi-Fi RX buffer per in-flight frame (1600 B each). With a
+# 5760-byte TCP receive window only a handful of data frames can be in flight
+# at once, so 8+8 dynamic buffers are ample. Larger caps were observed to
+# starve the AES-DMA path mid-read: the decrypt path could not allocate a
+# DMA-capable buffer, mbedTLS reported a read error, and the whole refresh
+# failed with ESP_FAIL after an arbitrary number of content bytes, even though
+# a later free-heap reading looked healthy.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=24
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 
 # --- Bluetooth LE ---
 # The language-study application does not use BLE. Disabling it frees internal

@@ -465,6 +465,105 @@ size_t ls_progress_remap_words(ls_progress_t *progress,
     return copied;
 }
 
+// Drop records whose word ID is not in `ids` until the table has room again,
+// oldest revision first. Same policy as ls_progress_prune_words(), but the
+// surviving set is an ID list rather than a pack.
+static void remap_prune_ids(ls_progress_t *progress, const uint32_t *ids,
+                            uint16_t count)
+{
+    while (progress->record_count >= LS_PROGRESS_RECORDS_MAX) {
+        size_t victim = LS_PROGRESS_RECORDS_MAX;
+        uint32_t victim_revision = UINT32_MAX;
+        for (uint16_t i = 0; i < progress->record_count; i++) {
+            const ls_progress_record_t *record = &progress->records[i];
+            bool present = false;
+            for (uint16_t j = 0; j < count; j++) {
+                if (ids[j] == record->word_id) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) continue;
+            if (record->revision <= victim_revision) {
+                victim_revision = record->revision;
+                victim = i;
+            }
+        }
+        if (victim == LS_PROGRESS_RECORDS_MAX) break;
+        memmove(&progress->records[victim], &progress->records[victim + 1],
+                (size_t)(progress->record_count - victim - 1) *
+                    sizeof(progress->records[0]));
+        progress->record_count--;
+    }
+}
+
+size_t ls_progress_remap_slices(ls_progress_t *progress,
+                                const ls_pack_t *old_pack, const char *text,
+                                const ls_pack_slice_view_t *scan)
+{
+    if (!progress || !old_pack || !text || !scan) return 0;
+    uint16_t old_count = (uint16_t)pack_word_count(old_pack);
+    if (old_count == 0) return 0;
+
+    uint16_t new_count = scan->word_count;
+    if (new_count > LS_GEN_WORDS_MAX) new_count = LS_GEN_WORDS_MAX;
+
+    // Compute the IDs ls_pack_assign_ids() will assign after the UI parses the
+    // text: FNV over the sliced word text, then bump each collision. Doing this
+    // up front lets the prune below see every new ID, not just the ones already
+    // processed.
+    uint32_t new_ids[LS_GEN_WORDS_MAX];
+    for (uint16_t i = 0; i < new_count; i++) {
+        char word[LS_WORD_TEXT_MAX + 1];
+        if (!ls_pack_slice_copy(text, &scan->words[i].text, word,
+                                sizeof(word))) {
+            new_ids[i] = 0;
+            continue;
+        }
+        uint32_t id = ls_word_id_for_text(word);
+        for (uint16_t j = 0; j < i; j++) {
+            if (new_ids[j] == id) {
+                id++;
+                j = (uint16_t)-1;  // restart the collision scan
+            }
+        }
+        new_ids[i] = id;
+    }
+
+    size_t copied = 0;
+    for (uint16_t i = 0; i < new_count; i++) {
+        if (new_ids[i] == 0) continue;
+        char word[LS_WORD_TEXT_MAX + 1];
+        if (!ls_pack_slice_copy(text, &scan->words[i].text, word,
+                                sizeof(word))) {
+            continue;
+        }
+        const ls_word_t *old_word =
+            words_find_text(old_pack->words, old_count, word);
+        if (!old_word || old_word->id == new_ids[i]) continue;
+        if (ls_progress_find(progress, new_ids[i])) continue;
+
+        const ls_progress_record_t *old_record =
+            ls_progress_find_const(progress, old_word->id);
+        if (!old_record) continue;
+
+        // Copy before prune/touch: both may memmove the table and invalidate
+        // the pointer we just looked up.
+        ls_progress_record_t snapshot = *old_record;
+
+        if (progress->record_count >= LS_PROGRESS_RECORDS_MAX) {
+            remap_prune_ids(progress, new_ids, new_count);
+        }
+        ls_progress_record_t *record =
+            ls_progress_touch(progress, new_ids[i]);
+        if (!record) break;
+        *record = snapshot;
+        record->word_id = new_ids[i];
+        copied++;
+    }
+    return copied;
+}
+
 size_t ls_progress_remap_text(ls_progress_t *progress,
                               const ls_pack_t *old_pack,
                               const ls_pack_t *new_pack)

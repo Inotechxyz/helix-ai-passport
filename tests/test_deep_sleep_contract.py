@@ -23,7 +23,15 @@ def initializer(source: str, symbol: str) -> str:
     return source[match.end():end]
 
 
+def strip_comments(source: str) -> str:
+    # A comment naming a function (e.g. "ls_app_start() re-checks ...") must not
+    # be mistaken for its definition by the signature regex below.
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"//[^\n]*", "", source)
+
+
 def function_body(source: str, name: str) -> str:
+    source = strip_comments(source)
     match = re.search(rf"\b{re.escape(name)}\s*\([^;]*?\)\s*\{{", source)
     if not match:
         raise AssertionError(f"function not found: {name}")
@@ -161,14 +169,29 @@ class DeepSleepContractTest(unittest.TestCase):
         self.assertIn("bsp_battery_init()", body)
         self.assertLess(body.index("bsp_battery_init()"), body.index("ls_ui_init()"))
 
-    def test_application_restores_the_header_status_before_the_ui(self) -> None:
+    def test_application_rechecks_links_instead_of_restoring_them(self) -> None:
         app = read("main/langstudy_app.c")
         body = function_body(app, "load_state")
-        # Deep sleep resets wifi_ok/deepseek_ok and the cached SOC is the only
-        # way the header can be drawn again before an online operation runs.
-        self.assertIn("ls_status_cache_get(", body)
-        self.assertIn("state->wifi_ok = cached.wifi_ok", body)
-        self.assertIn("state->deepseek_ok = cached.deepseek_ok", body)
+        # A boot/wake probe re-checks both links, so the header never shows a
+        # value saved before the reset that produced this boot.
+        self.assertNotIn("state->wifi_ok = cached.wifi_ok", body)
+        self.assertNotIn("state->deepseek_ok = cached.deepseek_ok", body)
+
+    def test_application_starts_the_silent_link_probe_at_boot(self) -> None:
+        app = read("main/langstudy_app.c")
+        body = function_body(app, "ls_app_start")
+        self.assertIn("ls_online_start(LS_ONLINE_PROBE)", body)
+        self.assertLess(body.index("ls_online_init()"),
+                        body.index("ls_online_start(LS_ONLINE_PROBE)"))
+
+    def test_launch_screen_is_skipped_on_a_deep_sleep_wake(self) -> None:
+        app = read("main/langstudy_app.c")
+        body = function_body(app, "ls_app_start")
+        # The GPIO wake check must precede the splash decision so a key wake
+        # returns straight to the study screen.
+        self.assertLess(body.index("ESP_SLEEP_WAKEUP_GPIO"),
+                        body.index("ls_splash_show("))
+        self.assertIn("if (!key_wake)", body)
 
     def test_application_saves_the_battery_before_sleeping_the_gauge(self) -> None:
         app = read("main/langstudy_app.c")
@@ -185,6 +208,16 @@ class DeepSleepContractTest(unittest.TestCase):
         self.assertIn("ls_status_cache_get(", init)
         self.assertLess(init.index("ls_status_cache_get("),
                         init.index("update_battery_bar("))
+
+    def test_ui_shutdown_never_deletes_the_active_screen_first(self) -> None:
+        ui = read("main/langstudy_ui.c")
+        body = function_body(ui, "ls_ui_shutdown")
+        # Deleting the active screen leaves LVGL's act_scr NULL; its refresh
+        # task then asserts and spins while holding the port mutex, so the
+        # deep-sleep path times out and restarts instead of sleeping. A blank
+        # screen must be loaded before the old tree is freed.
+        self.assertLess(body.index("lv_screen_load("),
+                        body.index("lv_obj_delete(s_scr)"))
 
     def test_battery_ready_check_does_not_trust_a_zero_reading(self) -> None:
         battery = read("components/bsp/src/bsp_battery.c")

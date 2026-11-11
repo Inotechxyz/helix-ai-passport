@@ -129,6 +129,25 @@ static void test_xp_rewards(void)
     CHECK(ls_buddy_award(&buddy, 1, true, &evolved) == 10);
     CHECK(evolved);
     CHECK(buddy.stage == 1);
+
+    // An already evolved buddy never regresses, even when its persisted stage
+    // is ahead of what the current XP table would derive (for example after a
+    // firmware update raises the thresholds).
+    buddy.xp = LS_BUDDY_XP_STAGE1 + 30;
+    buddy.stage = 3;
+    buddy.energy = 0;
+    evolved = true;
+    (void)ls_buddy_award(&buddy, 1, true, &evolved);
+    CHECK(buddy.stage == 3);
+    CHECK(!evolved);
+
+    // The session end path uses the same monotonic rule.
+    buddy.xp = LS_BUDDY_XP_STAGE1 + 30;
+    buddy.stage = 2;
+    evolved = true;
+    ls_buddy_finish_session(&buddy, 0, 1, NULL, &evolved);
+    CHECK(buddy.stage == 2);
+    CHECK(!evolved);
 }
 
 static void test_session_and_feeding(void)

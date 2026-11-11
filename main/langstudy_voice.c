@@ -60,13 +60,24 @@ bool ls_voice_cancelled(void)
 // Called on the voice worker only. Returns true when a station link is up.
 static bool voice_net_ready(void)
 {
+    // Never race the online worker for the radio. This must come before the
+    // connected check: during a check or probe the station link is up for the
+    // whole SNTP/DeepSeek phase, and taking it then would run Edge TTS
+    // concurrently with the worker that owns it.
+    if (ls_online_probe_active()) {
+        // The silent boot/wake probe only holds the radio for a few seconds,
+        // so wait for it instead of making the first word after boot fall back
+        // to the offline voice. Every other operation keeps the fallback.
+        for (int i = 0; i < 100 && ls_online_probe_active(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    if (ls_online_busy()) return false;
+
     if (ls_net_sta_connected()) {
         s_net_last_use = xTaskGetTickCount();
         return true;
     }
-    // Never race the online worker for the radio; fall back to the offline
-    // voice and let that operation finish.
-    if (ls_online_busy()) return false;
 
     const ls_config_t *config = &ls_state()->config;
     if (!ls_config_has_wifi(config)) return false;

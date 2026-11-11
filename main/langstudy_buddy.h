@@ -22,10 +22,12 @@
 #define LS_BUDDY_SNACKS_MAX 999
 #define LS_BUDDY_HAPPY_ENERGY 60
 
-// XP needed to reach each stage. Stage 3 is the final form.
-#define LS_BUDDY_XP_STAGE1 300
-#define LS_BUDDY_XP_STAGE2 900
-#define LS_BUDDY_XP_STAGE3 2000
+// Lifetime XP needed to reach each stage. Stage 3 is the final form. At the
+// default level a happy buddy earns roughly 50 XP per correct answer, so these
+// are about 3, 11 and 26 sessions (20 cards each) - deliberately challenging.
+#define LS_BUDDY_XP_STAGE1 2000
+#define LS_BUDDY_XP_STAGE2 8000
+#define LS_BUDDY_XP_STAGE3 20000
 
 #define LS_BUDDY_XP_PER_LEVEL 10
 

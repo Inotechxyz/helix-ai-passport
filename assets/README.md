@@ -28,6 +28,15 @@ Store reusable source images and generated display assets in `images/`.
 | [`images/logo-wordmark.png`](images/logo-wordmark.png) | 1648 × 336, PNG RGBA | Transparent black wordmark extracted from the repository's original `images/logo.png`; embedded in both project README files for light backgrounds. |
 | [`images/logo-wordmark-dark.png`](images/logo-wordmark-dark.png) | 1648 × 336, PNG RGBA | White version of the extracted wordmark, used by the README `<picture>` element when GitHub is in dark mode. |
 
+The launch-screen artwork is generated, not stored here. `tools/gen_splash.py`
+(Pillow) draws the 120 × 96 scene with a fixed random seed, scales it ×2 with
+nearest-neighbour sampling, and emits a 240 × 192 little-endian RGB565 array
+plus an `lv_image_dsc_t` into `main/langstudy_splash_img.c` and `.h` (about
+92 KiB of flash). The generator also writes `build/splash_preview.png`, which is
+a build artefact and is not committed. Run `python3 tools/gen_splash.py
+--check-only` to verify the committed files are current. The dedication string
+lives only in `main/langstudy_splash.c`.
+
 - Use descriptive names and document dimensions, pixel format, conversion steps, and destination.
 - Prefer formats suitable for the 240 × 320 RGB565 display and account for Flash and internal RAM.
 - Preserve editable sources where licensing permits, and record the source and license.

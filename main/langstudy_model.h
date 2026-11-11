@@ -126,11 +126,12 @@ typedef struct {
     ls_word_t words[LS_WORDS_MAX];
 } ls_pack_t;
 
-// Staging model for an online-generated pack. The prompt asks for
-// LS_WORD_TARGET words, so the worker can parse into this smaller structure
-// (~15.5 KiB) instead of the 100-word ls_pack_t (25 KiB). On the SRAM-only
-// ESP32-C3 the 25 KiB allocation fails after generation while the 16 KiB reply
-// buffer is still live; the UI copies this into state->pack afterwards.
+// Smaller pack model sized for an online-generated pack (LS_WORD_TARGET
+// words). The refresh path no longer stages a reply in it: after Wi-Fi/TLS the
+// SRAM-only ESP32-C3 could not reliably allocate even this ~15 KiB block, so
+// the worker hands the UI the text plus a slice index and the UI parses
+// directly into the resident ls_pack_t. The type still defines the generated
+// format's word cap and backs the view parser and host tests.
 #define LS_GEN_WORDS_MAX LS_WORD_TARGET
 typedef struct {
     uint16_t lesson_count;

@@ -24,6 +24,8 @@ idf_component_register(
          "langstudy_session.c"
          "langstudy_setup_form.c"
          "langstudy_setup_page.c"
+         "langstudy_splash.c"
+         "langstudy_splash_img.c"
          "langstudy_state.c"
          "langstudy_status_cache.c"
          "langstudy_store.c"

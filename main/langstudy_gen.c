@@ -73,11 +73,12 @@ static const char s_prompt_format[] =
     "pinyin (aim for 2-6 characters).\n"
     "- example: 0-56 chars (aim for 12-28), one short English sentence using "
     "the word.\n"
-    "- pron: 0-48 chars (aim for 16-26) of space-separated ARPAbet phonemes "
-    "(AA AE AH AO AW "
+    "- pron: required, 1-48 chars (aim for 16-26) of space-separated ARPAbet "
+    "phonemes (AA AE AH AO AW "
     "AY B CH D DH EH ER EY F G HH IH IY JH K L M N NG OW OY P R S SH T TH UH "
     "UW V W Y Z ZH); plain ASCII only, never IPA or /slashes/; mark primary "
-    "stress with ' before a vowel, for example: HH AH L 'OW.\n"
+    "stress with ' before a vowel, for example: HH AH L 'OW. Never leave pron "
+    "empty; a WORD line without it is dropped.\n"
     "- All 60 words must be unique (case-insensitive) and short enough for a "
     "240x320 screen.\n"
     "- Uniqueness is enforced by the device: if a word appears twice or "
@@ -1080,22 +1081,24 @@ static bool san_word_line(char *line, size_t cap, const san_field_t *fields,
     san_ascii(example, sizeof(example), fields[7].ptr, fields[7].len,
               LS_EXAMPLE_MAX);
     san_ascii(pron, sizeof(pron), fields[8].ptr, fields[8].len, LS_PRON_MAX);
-    if (!ls_pron_validate(pron)) {
+    if (pron[0] == '\0' || !ls_pron_validate(pron)) {
         // The model frequently ignores the "plain ARPAbet" instruction and
-        // answers with IPA ("/ˈpredʒədɪs/"). san_ascii() has just dropped the
-        // non-ASCII symbols, so convert from the untouched field before giving
-        // up; otherwise the word keeps its card but loses its pronunciation.
+        // answers with IPA ("/ˈpredʒədɪs/"), or leaves the field empty.
+        // san_ascii() has just dropped the non-ASCII symbols, so convert from
+        // the untouched field before giving up.
         char ipa[LS_PRON_MAX * 2 + 1];
         size_t ipa_len = fields[8].len;
         if (ipa_len > sizeof(ipa) - 1) ipa_len = sizeof(ipa) - 1;
         memcpy(ipa, fields[8].ptr, ipa_len);
         ipa[ipa_len] = '\0';
         if (ls_ipa_to_arpabet(ipa, pron, sizeof(pron)) == 0 ||
-            !ls_pron_validate(pron)) {
-            // IPA or any other unusable transcription is cleared rather than
-            // rejected: the word still shows, it simply has no spoken
-            // pronunciation.
-            pron[0] = '\0';
+            pron[0] == '\0' || !ls_pron_validate(pron)) {
+            // A card with no transcription cannot show IPA or speak the word
+            // (Edge TTS and the phoneme synthesizer both need it), so drop the
+            // line instead of surfacing a silent word. Header counts are
+            // recomputed, and a reply that drops below the minimum usable
+            // vocabulary is rejected and retried.
+            return false;
         }
     }
 

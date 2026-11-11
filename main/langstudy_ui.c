@@ -99,7 +99,6 @@ typedef enum {
     LS_MENU_SETTINGS,
     LS_MENU_SETUP,
     LS_MENU_NEW_SESSION,
-    LS_MENU_RESET,
     LS_MENU_BACK,
     LS_MENU_COUNT,
 } ls_menu_item_t;
@@ -113,7 +112,6 @@ static const char *const s_menu_text[LS_MENU_COUNT] = {
     "SETTINGS",
     "PHONE SETUP",
     "NEW SESSION",
-    "RESET PROGRESS",
     "BACK",
 };
 
@@ -185,8 +183,8 @@ static bool s_session_evolved;
 static bool s_session_snack;
 static lv_obj_t *s_profile_name_label;
 
-#define LS_PROGRESS_ROWS 2
-enum { LS_PROGRESS_SYNC = 0, LS_PROGRESS_BACK };
+#define LS_PROGRESS_ROWS 3
+enum { LS_PROGRESS_SYNC = 0, LS_PROGRESS_RESET, LS_PROGRESS_BACK };
 static lv_obj_t *s_progress_rows[LS_PROGRESS_ROWS];
 static lv_obj_t *s_progress_labels[LS_PROGRESS_ROWS];
 static int s_progress_index;
@@ -584,7 +582,6 @@ static void update_menu(void)
         [LS_MENU_SETTINGS] = true,
         [LS_MENU_SETUP] = true,
         [LS_MENU_NEW_SESSION] = true,
-        [LS_MENU_RESET] = true,
         [LS_MENU_BACK] = true,
     };
 
@@ -931,10 +928,15 @@ static void show_provision(void)
                     LS_UI_INK, "SET WI-FI + DEEPSEEK KEY\nHOLD OK TO FINISH");
 }
 
-static void show_confirm(void)
+// The confirm screen is reachable from PROGRESS; remember where to go when the
+// learner declines so the reset stays inside the menu section it lives in.
+static ls_view_t s_confirm_return_view = LS_VIEW_MENU;
+
+static void show_confirm(ls_view_t return_view)
 {
     lv_obj_t *m = begin_modal();
     s_view = LS_VIEW_CONFIRM;
+    s_confirm_return_view = return_view;
 
     make_text_label(m, 10, 10, 220, 20, &lv_font_montserrat_14,
                     LS_UI_ACCENT, "RESET PROGRESS?");
@@ -985,6 +987,12 @@ static void update_progress_view(void)
                 lv_color_hex(can_sync ? LS_UI_INK : LS_UI_MUTED), 0);
             lv_label_set_text_fmt(s_progress_labels[i], "SYNC NOW%s",
                                   can_sync ? "" : "  (SETUP)");
+        } else if (i == LS_PROGRESS_RESET) {
+            // Reset lives here instead of the main menu so the destructive
+            // action sits next to the data it erases.
+            lv_obj_set_style_text_color(s_progress_labels[i],
+                                        lv_color_hex(LS_UI_ACCENT), 0);
+            lv_label_set_text(s_progress_labels[i], "RESET PROGRESS");
         } else {
             lv_obj_set_style_text_color(s_progress_labels[i],
                                         lv_color_hex(LS_UI_INK), 0);
@@ -997,8 +1005,10 @@ static void show_progress(void)
 {
     ls_state_t *state = ls_state();
     lv_obj_t *m = begin_modal();
+    // Coming back from the RESET confirmation keeps the cursor where it was;
+    // entering PROGRESS from the menu starts on SYNC NOW.
+    if (s_view != LS_VIEW_CONFIRM) s_progress_index = 0;
     s_view = LS_VIEW_PROGRESS;
-    s_progress_index = 0;
 
     unsigned studied = studied_word_count();
     unsigned total = state->pack.word_count;
@@ -1033,8 +1043,10 @@ static void show_progress(void)
     for (int i = 0; i < LS_PROGRESS_ROWS; i++) {
         lv_obj_t *row = lv_obj_create(m);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, 12, 144 + i * 30);
-        lv_obj_set_size(row, 216, 26);
+        // The five statistics end at y=136; keep the first row clear of them
+        // and the last row clear of the hint at y=212.
+        lv_obj_set_pos(row, 12, 140 + i * 24);
+        lv_obj_set_size(row, 216, 22);
         lv_obj_set_style_radius(row, 4, 0);
         lv_obj_set_style_border_width(row, 1, 0);
         lv_obj_set_style_border_color(row, lv_color_hex(LS_UI_RULE), 0);
@@ -1116,8 +1128,10 @@ static void show_profile(void)
                     LS_UI_MUTED, "UP/DOWN NAME\nOK CREATE   HOLD OK BACK");
 }
 
-// Paint the 24x24 palette-index art into the 2x canvas. Index 0 is
-// transparent, so the paper background shows through.
+// Paint the 24x24 palette-index art into the 2x canvas. An RGB565 canvas has no
+// alpha channel: lv_canvas_set_px() ignores its opa argument and writes the
+// color only, so transparent pixels must be filled with the paper background
+// instead of being left black.
 static void paint_buddy(lv_obj_t *parent, const ls_buddy_t *buddy)
 {
     const uint8_t *px = ls_buddy_sprite(buddy->species, buddy->stage);
@@ -1129,21 +1143,21 @@ static void paint_buddy(lv_obj_t *parent, const ls_buddy_t *buddy)
     lv_obj_set_style_pad_all(canvas, 0, 0);
     lv_obj_set_style_border_width(canvas, 0, 0);
     lv_obj_set_style_bg_opa(canvas, LV_OPA_TRANSP, 0);
+    // The buffer is reused by every BUDDY visit, so refill it each time.
+    lv_canvas_fill_bg(canvas, lv_color_hex(LS_UI_PAPER), LV_OPA_COVER);
 
     for (int y = 0; y < LS_BUDDY_SPRITE_H; y++) {
         for (int x = 0; x < LS_BUDDY_SPRITE_W; x++) {
             uint8_t index = px[y * LS_BUDDY_SPRITE_W + x];
+            if (index == 0) continue;  // paper background, already filled
             lv_color_t color =
-                index ? lv_color_hex(ls_buddy_palette_color(buddy->species,
-                                                            index))
-                      : lv_color_black();
-            lv_opa_t opa = index ? LV_OPA_COVER : LV_OPA_TRANSP;
+                lv_color_hex(ls_buddy_palette_color(buddy->species, index));
             for (int dy = 0; dy < LS_BUDDY_SPRITE_ZOOM; dy++) {
                 for (int dx = 0; dx < LS_BUDDY_SPRITE_ZOOM; dx++) {
                     lv_canvas_set_px(canvas,
                                      x * LS_BUDDY_SPRITE_ZOOM + dx,
                                      y * LS_BUDDY_SPRITE_ZOOM + dy,
-                                     color, opa);
+                                     color, LV_OPA_COVER);
                 }
             }
         }
@@ -1211,7 +1225,12 @@ static void show_buddy(const char *note)
     else if (buddy->stage == 2) floor = LS_BUDDY_XP_STAGE2;
     int xp_permille = 1000;
     if (next > floor) {
-        xp_permille = (int)((buddy->xp - floor) * 1000u / (next - floor));
+        // Promote-only evolution can keep a buddy whose stage was earned under
+        // older thresholds below the new floor; never let xp - floor wrap.
+        xp_permille = buddy->xp <= floor
+                          ? 0
+                          : (int)((buddy->xp - floor) * 1000u / (next - floor));
+        if (xp_permille > 1000) xp_permille = 1000;
     }
     buddy_bar(m, 112, xp_permille, LS_UI_ACCENT);
 
@@ -1388,20 +1407,44 @@ static void answer_card(bool correct)
     }
 }
 
-static void apply_refresh(ls_gen_pack_t *pack, const char *note)
+static void apply_refresh(const char *text, size_t len, const char *note)
 {
     ls_state_t *state = ls_state();
+    // Resident on the UI thread (app_task). The stack has no room for this, and
+    // unlike a parsed model it never fragments the heap.
+    static ls_pack_slice_view_t scan;
 
-    // Match records by text first: the generated pack has different IDs.
-    ls_progress_remap_words(&state->progress, state->pack.words,
-                            state->pack.word_count, pack->words,
-                            pack->word_count);
-    ls_progress_drop_missing_words(&state->progress, pack->words,
-                                   pack->word_count);
+    // Re-validate on the UI thread before touching the active pack. The worker
+    // already scanned the text; a defensive failure here leaves the current
+    // pack and progress untouched.
+    if (ls_pack_scan_view(text, len, &scan) != LS_OK) {
+        show_status("REFRESH FAILED\nWORDS UNCHANGED", false,
+                    LS_STATUS_NEXT_MENU);
+        return;
+    }
 
-    // Promote the staging model into the active pack before saving; storage and
-    // the rest of the UI operate on the full ls_pack_t.
-    ls_pack_copy_generated(&state->pack, pack);
+    // Match records by text first: the generated pack has different IDs. The
+    // remap runs before the active pack is overwritten so the old words are
+    // still available for the match.
+    ls_progress_remap_slices(&state->progress, &state->pack, text, &scan);
+
+    // Parse straight into the resident active pack: no content-sized
+    // allocation after the TLS session that produced the reply. A successful
+    // scan means this parse cannot fail (same checks, caps no smaller than the
+    // generated format).
+    ls_status_t parsed = ls_pack_parse(text, len, &state->pack);
+    if (parsed != LS_OK) {
+        // Unreachable: a successful scan means this parse cannot fail (same
+        // checks, caps no smaller than the generated format). If it ever did,
+        // the parse has already cleared state->pack, so do not claim the words
+        // are unchanged.
+        show_status("REFRESH FAILED", false, LS_STATUS_NEXT_MENU);
+        return;
+    }
+    // Replace model-chosen IDs with the stable FNV IDs progress records key on.
+    ls_pack_assign_ids(state->pack.words, state->pack.word_count);
+    ls_progress_drop_missing_words(&state->progress, state->pack.words,
+                                   state->pack.word_count);
 
     uint32_t generation = 0;
     esp_err_t saved = ESP_FAIL;
@@ -1467,15 +1510,15 @@ static void handle_online(ls_online_msg_t *msg)
     if (msg->link_flags & LS_LINK_DEEPSEEK_KNOWN) {
         state->deepseek_ok = (msg->link_flags & LS_LINK_DEEPSEEK_OK) != 0;
     }
-    // Deep sleep resets the flags; save them so the next wake can draw the
-    // header before any online operation runs.
+    // Kept for the deep-sleep contract tests; link values are not restored on
+    // the next boot (the boot probe re-checks both hops instead).
     ls_status_cache_set_links(state->wifi_ok, state->deepseek_ok);
     update_link_icons();
 
     switch (msg->kind) {
     case LS_ONLINE_REFRESH_OK:
-        if (msg->pack) {
-            apply_refresh(msg->pack, msg->detail);
+        if (msg->text && msg->text_len) {
+            apply_refresh(msg->text, msg->text_len, msg->detail);
         } else {
             show_status("REFRESH FAILED", false, LS_STATUS_NEXT_MENU);
         }
@@ -1505,10 +1548,14 @@ static void handle_online(ls_online_msg_t *msg)
         show_status_titled("CONNECTION", msg->message, false,
                            LS_STATUS_NEXT_MENU);
         break;
+    case LS_ONLINE_PROBE_DONE:
+        // Silent boot/wake check: the link flags above already turned the
+        // header icons on or off; there is no screen to show.
+        break;
     }
-    free(msg->pack);
+    free(msg->text);
     free(msg->progress);
-    msg->pack = NULL;
+    msg->text = NULL;
     msg->progress = NULL;
 }
 
@@ -1529,6 +1576,10 @@ static void activate_progress(void)
 {
     if (s_progress_index == LS_PROGRESS_BACK) {
         show_menu();
+        return;
+    }
+    if (s_progress_index == LS_PROGRESS_RESET) {
+        show_confirm(LS_VIEW_PROGRESS);
         return;
     }
     if (!sync_ready()) {
@@ -1646,9 +1697,6 @@ static void activate_menu(void)
     case LS_MENU_NEW_SESSION:
         start_new_session();
         show_study();
-        break;
-    case LS_MENU_RESET:
-        show_confirm();
         break;
     case LS_MENU_BACK:
     default:
@@ -1999,7 +2047,11 @@ void ls_ui_on_key(bsp_btn_t btn, bsp_btn_ev_t ev)
             do_reset();
         } else if ((ev == BSP_BTN_CLICK && btn == BSP_BTN_DOWN) ||
                    (ev == BSP_BTN_LONG && btn == BSP_BTN_OK)) {
-            show_menu();
+            if (s_confirm_return_view == LS_VIEW_PROGRESS) {
+                show_progress();
+            } else {
+                show_menu();
+            }
         }
         break;
     }
@@ -2037,7 +2089,7 @@ void ls_ui_tick(void)
             handle_online(&msg);
             bsp_lvgl_unlock();
         } else {
-            free(msg.pack);
+            free(msg.text);
             free(msg.progress);
         }
     }
@@ -2100,6 +2152,19 @@ void ls_ui_shutdown(void)
         s_modal = NULL;
     }
     if (s_scr) {
+        // LVGL's refresh task dereferences the active screen on every cycle
+        // before it checks for NULL. Deleting the active screen here left
+        // act_scr NULL, tripped LV_ASSERT_NULL inside the LVGL task (which then
+        // spins forever holding the port mutex), and made enter_deep_sleep()'s
+        // bsp_lvgl_lock() time out, so the device restarted instead of ever
+        // entering deep sleep. Hand the display a blank screen first, then free
+        // the old tree.
+        lv_obj_t *blank = lv_obj_create(NULL);
+        if (blank) {
+            lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(blank, LV_OPA_COVER, 0);
+            lv_screen_load(blank);
+        }
         lv_obj_delete(s_scr);
         s_scr = NULL;
     }

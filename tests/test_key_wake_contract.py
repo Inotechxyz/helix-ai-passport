@@ -13,7 +13,15 @@ def read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def strip_comments(source: str) -> str:
+    # A comment naming a function (e.g. "ls_app_start() re-checks ...") must not
+    # be mistaken for its definition by the signature regex below.
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"//[^\n]*", "", source)
+
+
 def function_body(source: str, name: str) -> str:
+    source = strip_comments(source)
     match = re.search(rf"\b{re.escape(name)}\s*\([^;]*?\)\s*\{{", source)
     if not match:
         raise AssertionError(f"function not found: {name}")
