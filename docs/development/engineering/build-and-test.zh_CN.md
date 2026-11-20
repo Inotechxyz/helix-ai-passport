@@ -18,6 +18,8 @@
 > `idf.py build` 和
 > `idf.py flash` 只作为增量开发命令，不作为默认交付方式。
 
+端口识别以及合并/分段烧录的完整流程见[向设备烧录固件](flashing.zh_CN.md)。
+
 ```bash
 source <ESP-IDF-v5.5.3-路径>/export.sh
 idf.py --version             # 必须输出 ESP-IDF v5.5.3

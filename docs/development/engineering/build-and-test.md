@@ -21,6 +21,9 @@ the [environment bootstrap](environment-setup.md) first.
 > `idf.py build` and `idf.py flash` as incremental development commands, not the
 > default delivery path.
 
+For serial-port discovery and the complete merged or segmented procedure, see
+[flash firmware to the device](flashing.md).
+
 ```bash
 source <path-to-esp-idf-v5.5.3>/export.sh
 idf.py --version             # must report ESP-IDF v5.5.3

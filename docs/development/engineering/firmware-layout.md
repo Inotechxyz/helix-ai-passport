@@ -78,3 +78,6 @@ and flash targets that do not overwrite those data regions. `idf.py erase-flash`
 erases all user data. Do not add it as a routine prerequisite: use it only when
 a complete erase is explicitly intended and any data that must be kept has
 been saved.
+
+For port discovery, exact commands, and startup verification, see
+[flash firmware to the device](flashing.md).
